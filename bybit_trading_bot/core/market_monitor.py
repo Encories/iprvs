@@ -1,0 +1,866 @@
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import List, Tuple
+
+from bybit_trading_bot.config.settings import Config
+from bybit_trading_bot.utils.logger import get_logger
+from bybit_trading_bot.utils.db_manager import DBManager
+from bybit_trading_bot.utils.notifier import Notifier, TelegramCommandListener
+from bybit_trading_bot.core.data_processor import calculate_percentage_change, meets_thresholds
+from bybit_trading_bot.core.symbol_mapper import SymbolMapper
+from bybit_trading_bot.core.order_manager import OrderManager
+from bybit_trading_bot.handlers.spot_handler import SpotHandler
+from bybit_trading_bot.handlers.futures_handler import FuturesHandler
+from bybit_trading_bot.core.spike_detector import SpikeDetector, SpikeSignal
+
+try:
+    from pybit.unified_trading import HTTP as BYBIT_HTTP
+except Exception:
+    BYBIT_HTTP = None  # type: ignore
+
+
+@dataclass
+class Signal:
+    symbol_id: int
+    price_change_percent: float
+    oi_change_percent: float
+
+
+class MarketMonitor:
+    """Основной класс для мониторинга двух рынков.
+
+    Запускает 4 параллельных потока:
+    - Спот WebSocket (получение цен в реальном времени)
+    - OI polling (HTTP запросы каждые N секунд)
+    - Анализатор (проверка условий сигналов)
+    - Исполнитель (размещение ордеров по сигналам)
+
+    На этом этапе реализованы каркасы потоков и безопасная остановка.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.logger = get_logger(self.__class__.__name__)
+
+        self._stop_event = threading.Event()
+        self._threads: List[threading.Thread] = []
+        self.is_running: bool = False
+
+        # Infra
+        self.db = DBManager(self.config.database_path)
+        self.symbol_mapper = SymbolMapper(self.config, self.db)
+        self.order_manager = OrderManager(self.config, self.db)
+        self.notifier = Notifier(self.config)
+        self.tg_listener = TelegramCommandListener(self.config, on_stop=self._activate_runtime_emergency, on_rate=self._build_rate_report, on_start=self._deactivate_runtime_emergency, on_signal=self._on_tg_signal)
+        self.spot = SpotHandler(testnet=self.config.bybit_testnet)
+        self.futures = FuturesHandler(testnet=self.config.bybit_testnet)
+        # Split mode state
+        self._split_detectors: dict[str, SpikeDetector] = {}
+        self._split_last_price: dict[str, float] = {}
+
+        # Queues
+        self._pending_signals: List[Signal] = []
+        self._signals_lock = threading.Lock()
+        self._last_sync_time: float = 0.0
+        self._last_analyzer_summary: float = 0.0
+        self._runtime_emergency_stop: bool = False
+        self._loss_notify_sent: bool = False
+
+    def _build_rate_report(self) -> str:
+        try:
+            balance_str = "N/A"
+            if BYBIT_HTTP is not None and self.config.bybit_api_key and self.config.bybit_api_secret:
+                http = BYBIT_HTTP(testnet=self.config.bybit_testnet, api_key=self.config.bybit_api_key, api_secret=self.config.bybit_api_secret)
+                d = http.get_wallet_balance(accountType='UNIFIED')
+                lst = (d or {}).get('result', {}).get('list', [])
+                coins = lst[0].get('coin', []) if lst else []
+                usdt = [c for c in coins if c.get('coin') == 'USDT']
+                if usdt:
+                    bal = usdt[0].get('availableToTrade') or usdt[0].get('availableToWithdraw') or usdt[0].get('walletBalance')
+                    balance_str = str(bal)
+            total_pnl = self.db.get_total_pnl()
+            # ROI% относительно текущего баланса, если доступен
+            roi = None
+            try:
+                roi = (float(total_pnl) / float(balance_str)) * 100.0 if balance_str not in {"N/A", None, "0", 0} else None
+            except Exception:
+                roi = None
+            lines = [
+                f"Account balance (USDT): {balance_str}",
+                f"Total PnL (USDT): {total_pnl:.4f}",
+                f"ROI (%): {roi:.2f}" if roi is not None else "ROI (%): N/A",
+            ]
+            return "\n".join(lines)
+        except Exception as e:
+            self.logger.error(f"Build rate report error: {e}")
+            return "Rate error"
+
+    # ---- Public API ----
+    def start_monitoring(self) -> None:
+        """Запуск всех потоков мониторинга."""
+        if self.is_running:
+            self.logger.warning("Monitor already running")
+            return
+
+        self._runtime_emergency_stop = False
+        self._loss_notify_sent = False
+        self.logger.info(f"Starting market monitoring... DB: {self.config.database_path}")
+        self._stop_event.clear()
+
+        if self.config.switch_mode == "split":
+            # For now, only start Telegram listener and a placeholder thread
+            try:
+                self.tg_listener.start()
+            except Exception as e:
+                self.logger.error(f"Failed to start Telegram listener: {e}")
+            # Initialize detectors for active symbols
+            try:
+                # Ensure symbols mapping is created/refreshed for split mode
+                try:
+                    count = self.symbol_mapper.create_symbol_mapping()
+                    self.logger.info(f"Split: symbol map (re)initialized with {count} entries")
+                except Exception as e:
+                    self.logger.error(f"Split: failed to create symbol mapping: {e}")
+                if self.config.split_trading_pairs:
+                    raw = self.config.split_trading_pairs
+                    wl = [s.strip().upper() for s in (raw.split(",") if raw else []) if s.strip()]
+                    all_map = {rec.spot_symbol.upper(): rec.spot_symbol for rec in self.db.get_active_symbols()}
+                    symbols = [all_map[s] for s in wl if s in all_map]
+                    if not symbols:
+                        self.logger.warning("SPLIT_TRADING_PAIRS provided but none matched mapping; falling back to all active symbols")
+                        symbols = [rec.spot_symbol for rec in self.db.get_active_symbols()]
+                else:
+                    symbols = [rec.spot_symbol for rec in self.db.get_active_symbols()]
+                for sym in symbols:
+                    self._split_detectors[sym] = SpikeDetector(self.config, order_manager=self.order_manager)
+                if symbols:
+                    # Subscribe tickers and orderbook/trades; route to split handlers
+                    self.spot.subscribe_tickers_with_callback(symbols, self._on_split_ticker)
+                    try:
+                        # Access underlying ws handler to subscribe extra channels
+                        from bybit_trading_bot.handlers.websocket_handler import WebSocketHandler as _WS
+                        if isinstance(self.spot.ws, _WS):
+                            self.spot.ws.subscribe_orderbook_and_trades(symbols, on_orderbook=self._on_split_orderbook, on_trade=self._on_split_trade)  # type: ignore[attr-defined]
+                    except Exception as e:
+                        self.logger.debug(f"Split extra subscriptions failed: {e}")
+            except Exception as e:
+                self.logger.error(f"Split init failed: {e}")
+            self._threads = [
+                threading.Thread(target=self._split_loop, name="SplitMode", daemon=True),
+            ]
+            for t in self._threads:
+                t.start()
+            self.is_running = True
+            self.logger.info("MarketMonitor started (split mode)")
+            return
+
+        # Build mapping once at startup
+        try:
+            count = self.symbol_mapper.create_symbol_mapping()
+            self.logger.info(f"Symbol map initialized with {count} entries")
+        except Exception as e:
+            self.logger.error(f"Failed to create symbol mapping: {e}")
+
+        # Subscribe to spot tickers (best-effort, list may be empty offline)
+        try:
+            symbols = [rec.spot_symbol for rec in self.db.get_active_symbols()]
+            if symbols:
+                self.spot.subscribe_tickers_with_callback(symbols, self._on_spot_ticker)
+        except Exception as e:
+            self.logger.error(f"Failed to subscribe tickers: {e}")
+
+        # Start Telegram commands listener
+        try:
+            self.tg_listener.start()
+        except Exception as e:
+            self.logger.error(f"Failed to start Telegram listener: {e}")
+
+        # Initial backfill sync
+        # Removed initial order sync to revert last change
+
+        self._threads = [
+            threading.Thread(target=self._run_spot_ws, name="SpotWS", daemon=True),
+            threading.Thread(target=self._run_oi_poll, name="OIPoll", daemon=True),
+            threading.Thread(target=self._run_analyzer, name="Analyzer", daemon=True),
+            threading.Thread(target=self._run_executor, name="Executor", daemon=True),
+        ]
+
+        for t in self._threads:
+            t.start()
+
+        self.is_running = True
+        self.logger.info("MarketMonitor started")
+
+    def stop_monitoring(self) -> None:
+        """Корректная остановка всех процессов."""
+        if not self.is_running:
+            return
+
+        self.logger.info("Stopping market monitoring...")
+        self._stop_event.set()
+        try:
+            self.tg_listener.stop()
+        except Exception:
+            pass
+        for t in self._threads:
+            if t.is_alive():
+                t.join(timeout=5)
+
+        self._threads.clear()
+        self.is_running = False
+        self.logger.info("MarketMonitor stopped")
+
+    def _can_open_new_position(self, symbol_id: int) -> bool:
+        if self.db.count_open_positions() >= self.config.max_simultaneous_positions:
+            return False
+        if self.db.has_open_position(symbol_id):
+            return False
+        cooldown = timedelta(minutes=max(1, int(self.config.trade_cooldown_minutes)))
+        last_trade = self.db.get_last_trade_time(symbol_id)
+        if last_trade and (datetime.utcnow() - last_trade) < cooldown:
+            return False
+        return True
+
+    def check_trading_conditions(self, symbol_id: int) -> Tuple[bool, float, float]:
+        """Проверка условий: цена +X% И OI +Y%.
+
+        OI считается по времени относительно 5‑минутных баров: берём текущее значение и
+        значение на момент (now - N*5 минут), где N = SIGNAL_WINDOW_MINUTES // 5.
+        Если подходящей точки нет, используем первую в окне; при недостатке точек возвращаем 0%.
+        """
+        price_series = self.db.get_recent_price_series(symbol_id, minutes=self.config.signal_window_minutes)
+        oi_series = self.db.get_recent_oi_series(symbol_id, minutes=self.config.signal_window_minutes)
+        price_change = calculate_percentage_change(price_series)
+
+        # Дедуп OI по 5м барам (квантование по времени) и расчёт с учётом настроек
+        def _dedup_5m_bars(series: List[Tuple[datetime, float]]) -> List[Tuple[int, float]]:
+            seen: set[int] = set()
+            out: List[Tuple[int, float]] = []
+            for ts, val in series:
+                try:
+                    bar = int((ts.timestamp() * 1000) // (5 * 60_000))
+                except Exception:
+                    continue
+                if bar in seen:
+                    continue
+                seen.add(bar)
+                out.append((bar, float(val)))
+            return out
+
+        bars = _dedup_5m_bars(oi_series)
+        n_bars = max(1, int(self.config.signal_window_minutes) // 5)
+        oi_change: float | None = None
+        if len(bars) >= max(self.config.min_unique_oi_bars, n_bars + 1):
+            last_oi = float(bars[-1][1])
+            prev_oi = float(bars[-(n_bars + 1)][1])
+            oi_change = 0.0 if prev_oi == 0 else (last_oi - prev_oi) / prev_oi * 100.0
+        elif bars:
+            # мягкая оценка по имеющимся точкам
+            seq = [v for _, v in bars]
+            from bybit_trading_bot.core.data_processor import calculate_percentage_change_from_series
+            oi_change = calculate_percentage_change_from_series(seq)
+
+        # Проверки OI-ограничений/деградации
+        oi_ok = True
+        if oi_change is None and self.config.require_oi_for_signal:
+            oi_ok = False
+        if oi_change is not None and oi_change < self.config.oi_negative_block_threshold:
+            oi_ok = False
+
+        if self.config.price_only_mode:
+            return (price_change >= self.config.price_change_threshold and oi_ok), price_change, oi_change or 0.0
+        # Лестница условий: breakout price-only, затем строгий AND
+        if price_change >= self.config.price_only_breakout_threshold and oi_ok:
+            return True, price_change, oi_change or 0.0
+        ok = (
+            oi_ok
+            and price_change >= self.config.price_change_threshold
+            and (oi_change is not None)
+            and (oi_change >= self.config.oi_change_threshold)
+        )
+        return ok, price_change, oi_change or 0.0
+
+    def execute_trade_signal(self, symbol_id: int, price_change: float, oi_change: float) -> None:
+        """Выполнение торговой сделки при срабатывании сигнала с защитами и TP."""
+        try:
+            if not self._can_open_new_position(symbol_id):
+                return
+            symbol_rec = next((r for r in self.db.get_active_symbols() if r.id == symbol_id), None)
+            if not symbol_rec:
+                return
+            symbol = symbol_rec.spot_symbol
+            last_price = self.db.get_last_price(symbol_id) or 0.0
+            if last_price <= 0.0:
+                return
+            qty = self.order_manager.calculate_position_size(
+                symbol=symbol,
+                current_price=last_price,
+                account_equity_usdt=self.config.account_equity_usdt,
+            )
+            if qty <= 0.0:
+                return
+            tp_price = last_price * (1.0 + self.config.take_profit_percent / 100.0)
+            order = self.order_manager.place_spot_order(
+                symbol,
+                "Buy",
+                qty,
+                tp_price,
+                reference_price=last_price,
+            )
+            if not order:
+                self.notifier.send_telegram(f"ORDER FAILED: {symbol}")
+                return
+            order_id = str(order.get("orderId") or order.get("result", {}).get("orderId") or f"UNKWN-{symbol}")
+            # try to wait fill briefly to get exact filled qty and avgPrice
+            filled = self.order_manager.wait_for_filled(order_id, timeout_s=6.0)
+            if filled and isinstance(filled, dict):
+                try:
+                    avg = float(filled.get("avgPrice") or filled.get("price") or last_price)
+                except Exception:
+                    avg = last_price
+                try:
+                    fqty = float(filled.get("cumExecQty") or filled.get("qty") or qty)
+                except Exception:
+                    fqty = qty
+                # fees (approx entry)
+                try:
+                    fee_rate = float(self.config.fee_rate)
+                    fee_entry = avg * fqty * fee_rate
+                except Exception:
+                    fee_entry = None
+                if fqty > 0.0:
+                    safe_qty = self.order_manager.adjust_qty_for_safety(symbol, fqty)
+                    tp_resp = self.order_manager.place_tp_limit(symbol, safe_qty, tp_price)
+                    try:
+                        tp_id = str(tp_resp.get("orderId") or tp_resp.get("result", {}).get("orderId") ) if tp_resp else None
+                    except Exception:
+                        tp_id = None
+                    try:
+                        self.db.update_trade_entry_qty(order_id, avg, safe_qty)
+                        if tp_id:
+                            self.db.set_trade_tp_order(order_id, tp_id)
+                        if fee_entry is not None:
+                            self.db.update_trade_fees(order_id, fee_entry=fee_entry)
+                    except Exception:
+                        pass
+                    # Optionally place exchange SL at break-even to protect from loss
+                    try:
+                        if self.config.place_exchange_sl:
+                            r = float(self.config.fee_rate)
+                            be_price = avg * (1.0 + r) / max(1e-12, (1.0 - r))
+                            # если цена уже ниже BE, всё равно ставим триггер на BE, биржа выполнит при возврате
+                            sl_resp = self.order_manager.place_sl_stop_limit(symbol, safe_qty, be_price)
+                            try:
+                                sl_id = str(sl_resp.get("orderId") or sl_resp.get("result", {}).get("orderId")) if sl_resp else None
+                                if sl_id:
+                                    self.db.set_trade_sl_order(order_id, sl_id, be_price)
+                                    self.notifier.send_telegram(f"BE SL PLACED: {symbol} trigger={be_price:.6f}")
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        self.logger.debug(f"Place BE SL error {symbol}: {e}")
+                    self.db.insert_signal(symbol_id, price_change, oi_change, action_taken="bought")
+                    # expected PnL: gross and net (with fees)
+                    try:
+                        expected_gross = (tp_price - avg) * safe_qty
+                        fee_rate = float(self.config.fee_rate)
+                        expected_fees = (avg * safe_qty + tp_price * safe_qty) * fee_rate
+                        expected_net = expected_gross - expected_fees
+                    except Exception:
+                        expected_gross = None
+                        expected_net = None
+                    extra = ""
+                    if expected_gross is not None:
+                        extra += f" expected_pnl={expected_gross:.4f}"
+                    if expected_net is not None:
+                        extra += f" expected_pnl_net={expected_net:.4f}"
+                    self.notifier.send_telegram(f"ORDER FILLED: {symbol} qty={safe_qty} avg={avg:.6f}{extra}")
+                    self.logger.info(f"ORDER FILLED: {symbol} qty={safe_qty} avg={avg}")
+                    return
+            avail_qty = self.order_manager.get_available_base_qty(symbol, max_wait_s=6.0)
+            if avail_qty <= 0.0:
+                avail_qty = self.order_manager.get_filled_base_qty(symbol, order_id, max_wait_s=6.0)
+            if avail_qty <= 0.0:
+                avail_qty = qty
+            safe_qty = self.order_manager.adjust_qty_for_safety(symbol, avail_qty)
+            tp_resp = self.order_manager.place_tp_limit(symbol, safe_qty, tp_price)
+            if not tp_resp:
+                self.notifier.send_telegram(f"TP PLACE FAILED: {symbol}")
+            self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, last_price, tp_price, "open", stop_loss_price=None, tp_order_id=(tp_resp or {}).get("orderId") if tp_resp else None)
+            self.db.insert_signal(symbol_id, price_change, oi_change, action_taken="bought")
+            try:
+                # remaining open order slots
+                max_pos = int(self.config.max_simultaneous_positions)
+                open_now = int(self.db.count_open_positions())
+                remaining = max(0, max_pos - open_now)
+            except Exception:
+                remaining = None
+            extra = f" | slots_left={remaining}" if remaining is not None else ""
+            self.notifier.send_telegram(f"ORDER PLACED: {symbol} qty={safe_qty} entry={last_price:.6f} tp={tp_price:.6f}{extra}")
+            self.logger.info(f"✅ ORDER PLACED: {symbol} - Qty: {safe_qty}, TP: {tp_price}")
+        except Exception as e:
+            self.logger.error(f"Failed to execute trade signal for {symbol_id}: {e}")
+
+    # ---- Callbacks ----
+    def _on_spot_ticker(self, symbol: str, price: float, ts_epoch: float) -> None:
+        try:
+            records = self.db.get_active_symbols()
+            rec = next((r for r in records if r.spot_symbol == symbol), None)
+            if rec:
+                self.db.insert_price(rec.id, price)
+        except Exception as e:
+            self.logger.debug(f"Failed to persist price for {symbol}: {e}")
+
+    # ---- Internal workers ----
+    def _run_spot_ws(self) -> None:
+        self.logger.info("Spot WS worker started")
+        while not self._stop_event.is_set():
+            time.sleep(1.0)
+        self.logger.info("Spot WS worker stopped")
+
+    def _split_loop(self) -> None:
+        self.logger.info("Split mode loop started")
+        while not self._stop_event.is_set():
+            try:
+                time.sleep(0.2)
+            except Exception:
+                time.sleep(0.5)
+        self.logger.info("Split mode loop stopped")
+
+    def _on_split_ticker(self, symbol: str, price: float, ts_epoch: float) -> None:
+        try:
+            det = self._split_detectors.get(symbol)
+            if det is None:
+                det = SpikeDetector(self.config, order_manager=self.order_manager)
+                self._split_detectors[symbol] = det
+            prev = self._split_last_price.get(symbol)
+            pseudo_vol = 0.0
+            if prev and prev > 0:
+                try:
+                    pseudo_vol = abs(price - prev) / prev
+                except Exception:
+                    pseudo_vol = 0.0
+            self._split_last_price[symbol] = price
+            det.update_market_data(price, max(pseudo_vol, 0.0), datetime.utcnow())
+            sig = det.generate_trading_signal(symbol)
+            if sig and sig.strength >= float(self.config.split_min_signal_strength):
+                # Enforce split max open orders
+                try:
+                    if self.db.count_open_sp_orders() >= int(self.config.split_max_open_orders):
+                        return
+                except Exception:
+                    pass
+                # cooldown
+                last_sp = self.db.get_last_sp_signal_time(symbol)
+                if last_sp is not None and (datetime.utcnow() - last_sp) < timedelta(minutes=self.config.cooldown_minutes_split):
+                    return
+                signal_id = self.db.insert_sp_signal(
+                    timestamp=sig.timestamp,
+                    symbol=symbol,
+                    signal_type="volume_spike",
+                    signal_strength=sig.strength,
+                    price=sig.price,
+                    volume=sig.volume,
+                )
+                order_id = det.execute_signal(sig)
+                if order_id:
+                    self.db.insert_sp_order(signal_id, order_id, symbol, "Buy", (self.config.trade_notional_usdt or 0.0) / max(price, 1e-9), price * (1.0 - float(self.config.limit_order_offset)), status="placed")
+                    self.notifier.send_telegram(f"SPLIT ORDER: {symbol} placed limit with TP {self.config.target_profit_pct*100:.2f}%")
+        except Exception as e:
+            self.logger.error(f"Split ticker handler error for {symbol}: {e}")
+
+    def _on_split_orderbook(self, symbol: str, best_bid: float, best_ask: float, bids: list, asks: list) -> None:
+        try:
+            det = self._split_detectors.get(symbol)
+            if det is None:
+                det = SpikeDetector(self.config, order_manager=self.order_manager)
+                self._split_detectors[symbol] = det
+            det.update_orderbook(best_bid, best_ask, bids=bids, asks=asks, levels=5)
+        except Exception as e:
+            self.logger.debug(f"Split orderbook error {symbol}: {e}")
+
+    def _on_split_trade(self, symbol: str, price: float, qty: float, ts: float) -> None:
+        try:
+            # Use trade volumes to enrich volume buffer
+            det = self._split_detectors.get(symbol)
+            if det is None:
+                det = SpikeDetector(self.config, order_manager=self.order_manager)
+                self._split_detectors[symbol] = det
+            # approximate: push price and qty as volume increment
+            det.update_market_data(price, max(qty, 0.0), datetime.utcnow())
+        except Exception as e:
+            self.logger.debug(f"Split trade error {symbol}: {e}")
+
+    def _run_oi_poll(self) -> None:
+        self.logger.info("OI polling worker started")
+        interval = max(1, int(self.config.monitoring_interval_seconds))
+        while not self._stop_event.is_set():
+            try:
+                for rec in self.db.get_active_symbols():
+                    # Monetary OI
+                    oi_val = self.futures.get_open_interest(rec.futures_symbol)
+                    # Contracts (tokens) directly from Bybit
+                    oi_contracts = self.futures.get_open_interest_contracts(rec.futures_symbol)
+                    # Tokens derived from markPrice of the same moment
+                    mark = self.futures.get_mark_price(rec.futures_symbol)
+                    oi_tokens_mark = None
+                    if oi_val is not None and mark is not None and mark > 0:
+                        try:
+                            oi_tokens_mark = float(oi_val) / float(mark)
+                        except Exception:
+                            oi_tokens_mark = None
+                    # Compute nOI against window
+                    noi_percent = None
+                    try:
+                        series = self.db.get_recent_oi_series(rec.id, minutes=self.config.signal_window_minutes)
+                        vals = [v for (_, v) in series]
+                        if oi_val is not None:
+                            vals.append(float(oi_val))
+                        if vals:
+                            vmin = min(vals)
+                            vmax = max(vals)
+                            if vmax > vmin and oi_val is not None:
+                                noi_percent = (float(oi_val) - vmin) / (vmax - vmin) * 100.0
+                    except Exception:
+                        noi_percent = None
+                    if oi_val is not None:
+                        self.db.insert_oi(
+                            rec.id,
+                            oi_val,
+                            oi_value=oi_val,
+                            oi_tokens=oi_contracts,
+                            oi_tokens_mark=oi_tokens_mark,
+                            noi_percent=noi_percent,
+                        )
+            except Exception as e:
+                self.logger.error(f"OI polling error: {e}")
+            time.sleep(interval)
+        self.logger.info("OI polling worker stopped")
+
+    def _check_loss_streak_and_stop(self) -> None:
+        try:
+            # Check 10-consecutive losing
+            pnls10 = self.db.get_last_closed_pnls(10)
+            if len(pnls10) == 10 and all(p < 0 for p in pnls10):
+                if not self._is_emergency():
+                    self.logger.error("Emergency stop: 10 consecutive losing trades detected. Trading paused.")
+                    if not getattr(self, "_loss_notify_sent", False):
+                        self.notifier.send_telegram("EMERGENCY STOP: 10 consecutive losing trades. Trading paused.")
+                        self._loss_notify_sent = True
+                    self._runtime_emergency_stop = True
+                    return
+            # Check >50% losing among last 50
+            pnls50 = self.db.get_last_closed_pnls(50)
+            if len(pnls50) >= 10:  # ensure at least 10 trades before applying ratio rule
+                losses = sum(1 for p in pnls50 if p < 0)
+                if losses / len(pnls50) > 0.5:
+                    if not self._is_emergency():
+                        self.logger.error(
+                            f"Emergency stop: losing rate {losses}/{len(pnls50)} (>50%). Trading paused."
+                        )
+                        if not getattr(self, "_loss_notify_sent", False):
+                            self.notifier.send_telegram(
+                                f"EMERGENCY STOP: Losing rate {losses}/{len(pnls50)} (>50%). Trading paused."
+                            )
+                            self._loss_notify_sent = True
+                        self._runtime_emergency_stop = True
+                        return
+        except Exception as e:
+            self.logger.error(f"Loss-streak/rate check error: {e}")
+
+    def _run_analyzer(self) -> None:
+        self.logger.info("Analyzer worker started")
+        while not self._stop_event.is_set():
+            try:
+                if self.config.switch_mode == "tg":
+                    time.sleep(1.0)
+                    continue
+                symbols = self.db.get_active_symbols()
+                ok_found = 0
+                if self._is_emergency():
+                    time.sleep(2.0)
+                    continue
+                for rec in symbols:
+                    # Verbose: print which pair is being analyzed
+                    self.logger.info(f"Analyzing: {rec.spot_symbol}")
+                    ok, pchg, oichg = self.check_trading_conditions(rec.id)
+                    # lightweight observability: log when near thresholds
+                    if not ok and (pchg >= self.config.price_change_threshold * 0.8 or oichg >= self.config.oi_change_threshold * 0.8):
+                        self.logger.debug(f"Near thresholds for {rec.spot_symbol}: price {pchg:.2f}% oi {oichg:.2f}%")
+                    # Spike up/down detection and suppression interval (N bars)
+                    n_bars = max(1, int(self.config.signal_window_minutes) // 5)
+                    # Suppress if last signal < N bars (use timestamps)
+                    last_sig_ts = self.db.get_last_signal_time(rec.id)
+                    if last_sig_ts is not None:
+                        # Convert bars to minutes horizon
+                        min_gap = timedelta(minutes=n_bars * 5)
+                        if datetime.utcnow() - last_sig_ts < min_gap:
+                            continue
+                    # В trade-режиме ставим в очередь только валидные положительные сигналы (ok)
+                    if ok:
+                        with self._signals_lock:
+                            self._pending_signals.append(
+                                Signal(symbol_id=rec.id, price_change_percent=pchg, oi_change_percent=oichg)
+                            )
+                        self.db.insert_signal(rec.id, pchg, oichg, action_taken="queued")
+                        ok_found += 1
+                now = time.time()
+                if now - self._last_analyzer_summary >= 30.0:
+                    self.logger.info(f"Analyzer summary: scanned={len(symbols)} signals_found={ok_found}")
+                    self._last_analyzer_summary = now
+                # Periodically check loss streak
+                self._check_loss_streak_and_stop()
+            except Exception as e:
+                self.logger.error(f"Analyzer error: {e}")
+            time.sleep(2.0)
+        self.logger.info("Analyzer worker stopped")
+
+    def _is_emergency(self) -> bool:
+        return self.config.emergency_stop or getattr(self, "_runtime_emergency_stop", False)
+
+    def _monitor_take_profit_once(self) -> None:
+        try:
+            open_trades = self.db.get_open_trades()
+            if not open_trades:
+                return
+            symbols_by_id = {rec.id: rec.spot_symbol for rec in self.db.get_active_symbols()}
+            for tr in open_trades:
+                last_price = self.db.get_last_price(tr.symbol_id)
+                if last_price is None:
+                    continue
+                # TP check
+                if last_price >= tr.take_profit_price:
+                    symbol = symbols_by_id.get(tr.symbol_id, "")
+                    if symbol:
+                        resp = self.order_manager.close_position_market(symbol, tr.quantity)
+                        if resp:
+                            pnl_gross = (tr.take_profit_price - tr.entry_price) * tr.quantity
+                            # approximate fees: entry + exit on quote side
+                            try:
+                                fee_rate = float(self.config.fee_rate)
+                            except Exception:
+                                fee_rate = 0.001
+                            fee_entry = tr.entry_price * tr.quantity * fee_rate
+                            fee_exit = tr.take_profit_price * tr.quantity * fee_rate
+                            pnl_net = pnl_gross - (fee_entry + fee_exit)
+                            self.db.close_trade(tr.order_id, pnl_net)
+                            try:
+                                # save close order info if id present
+                                close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
+                                if close_id:
+                                    self.db.set_trade_close_info(tr.order_id, close_id, tr.take_profit_price)
+                                self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
+                                # best-effort: cancel any remaining protective orders (TP/SL) after closing
+                                try:
+                                    symbol = symbol or symbols_by_id.get(tr.symbol_id, "")
+                                    if getattr(tr, "tp_order_id", None):
+                                        self.order_manager.cancel_order(symbol, str(tr.tp_order_id))
+                                    if getattr(tr, "sl_order_id", None):
+                                        self.order_manager.cancel_order(symbol, str(tr.sl_order_id))
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            # percent PnL relative to notional
+                            notional = tr.entry_price * tr.quantity
+                            pct = (pnl_net / notional * 100.0) if notional > 0 else 0.0
+                            msg = f"TP HIT: {symbol} pnl_net={pnl_net:.4f} ({pct:.2f}%)"
+                            try:
+                                self.notifier.send_telegram(msg)
+                            except Exception:
+                                pass
+                            self.notifier.send_telegram(msg)
+                            self.logger.info(
+                                f"TP hit: symbol_id={tr.symbol_id} closed {tr.quantity} at {last_price} (TP {tr.take_profit_price}) net={pnl_net:.4f} ({pct:.2f}%)"
+                            )
+                        else:
+                            self.logger.error(f"TP close failed for {symbol} (order_id={tr.order_id}) - will retry")
+                    continue
+                # Emergency drawdown SL: if price falls >= 10% from entry, market exit
+                try:
+                    threshold_pct = 10.0  # fixed drawdown threshold
+                    if tr.entry_price > 0:
+                        drop_pct = (last_price - tr.entry_price) / tr.entry_price * 100.0
+                        if drop_pct <= -abs(threshold_pct):
+                            symbol = symbols_by_id.get(tr.symbol_id, "")
+                            if symbol:
+                                resp = self.order_manager.close_position_market(symbol, tr.quantity)
+                                if resp:
+                                    # try to fetch filled avg price
+                                    try:
+                                        close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
+                                    except Exception:
+                                        close_id = None
+                                    close_price = last_price
+                                    if close_id:
+                                        row = self.order_manager.wait_for_filled(close_id, timeout_s=5.0)
+                                        try:
+                                            if isinstance(row, dict):
+                                                cp = row.get("avgPrice") or row.get("price")
+                                                if cp is not None:
+                                                    close_price = float(cp)
+                                        except Exception:
+                                            pass
+                                    # net PnL with fees
+                                    try:
+                                        fee_rate = float(self.config.fee_rate)
+                                    except Exception:
+                                        fee_rate = 0.001
+                                    fee_entry = tr.entry_price * tr.quantity * fee_rate
+                                    fee_exit = close_price * tr.quantity * fee_rate
+                                    pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
+                                    self.db.close_trade(tr.order_id, pnl_net)
+                                    try:
+                                        if close_id:
+                                            self.db.set_trade_close_info(tr.order_id, close_id, close_price)
+                                        self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
+                                    except Exception:
+                                        pass
+                                    msg = (
+                                        f"DRAWDOWN EXIT: {symbol} drop={drop_pct:.2f}% qty={tr.quantity} "
+                                        f"entry={tr.entry_price:.6f} close={close_price:.6f} pnl_net={pnl_net:.4f}"
+                                    )
+                                    try:
+                                        self.notifier.send_telegram(msg)
+                                    except Exception:
+                                        pass
+                                    self.logger.info(msg)
+                                else:
+                                    self.logger.error(f"Drawdown close failed for {symbol} (order_id={tr.order_id}) - will retry")
+                            continue
+                except Exception as e:
+                    self.logger.debug(f"Drawdown SL error: {e}")
+        except Exception as e:
+            self.logger.error(f"TP/SL monitor error: {e}")
+
+    def _run_executor(self) -> None:
+        self.logger.info("Executor worker started")
+        while not self._stop_event.is_set():
+            try:
+                if self._is_emergency():
+                    with self._signals_lock:
+                        self._pending_signals.clear()
+                    self._monitor_take_profit_once()
+                    now = time.time()
+                    if now - self._last_sync_time >= 20.0:
+                        self.order_manager.sync_cancellations()
+                        self._last_sync_time = now
+                    time.sleep(1.0)
+                    continue
+                if self.config.switch_mode == "tg":
+                    # In tg mode ignore Bybit signals, but still monitor TP/SL
+                    self._monitor_take_profit_once()
+                    time.sleep(1.0)
+                    continue
+                signal_obj: Signal | None = None
+                with self._signals_lock:
+                    if self._pending_signals:
+                        signal_obj = self._pending_signals.pop(0)
+                if signal_obj:
+                    self.execute_trade_signal(
+                        symbol_id=signal_obj.symbol_id,
+                        price_change=signal_obj.price_change_percent,
+                        oi_change=signal_obj.oi_change_percent,
+                    )
+                self._monitor_take_profit_once()
+                now = time.time()
+                if now - self._last_sync_time >= 20.0:
+                    self.order_manager.sync_cancellations()
+                    self._last_sync_time = now
+                # Periodically check loss streak
+                self._check_loss_streak_and_stop()
+            except Exception as e:
+                self.logger.error(f"Executor error: {e}")
+            time.sleep(1.0)
+        self.logger.info("Executor worker stopped")
+
+    def _on_tg_signal(self, text: str) -> None:
+        """Parse PumpScreener-like message and place a spot market buy on Bybit.
+
+        Expected format:
+        EDU-USDT | BINANCE_FUTURES\n price: 5.6%\n open interest: 10.37%\n signals (24h): 4
+        """
+        if self.config.switch_mode != "tg":
+            return
+        try:
+            line0 = text.splitlines()[0].strip()
+            left = line0.split("|")[0].strip() if "|" in line0 else line0
+            spot_symbol = left.replace("-", "")
+            # Find our symbol id by spot symbol mapping
+            recs = self.db.get_active_symbols()
+            rec = next((r for r in recs if r.spot_symbol.upper() == spot_symbol.upper()), None)
+            if not rec:
+                msg = f"TG signal symbol not found in mapping: {spot_symbol}"
+                self.logger.warning(msg)
+                try:
+                    self.notifier.send_telegram(msg)
+                except Exception:
+                    pass
+                return
+            last_price = self.db.get_last_price(rec.id) or 0.0
+            if last_price <= 0.0:
+                self.logger.warning(f"No recent price for {spot_symbol}")
+                return
+            qty = self.order_manager.calculate_position_size(spot_symbol, last_price, self.config.account_equity_usdt)
+            if qty <= 0.0:
+                self.logger.warning(f"Calculated qty is zero for {spot_symbol}")
+                return
+            tp_price = last_price * (1.0 + self.config.take_profit_percent / 100.0)
+            order = self.order_manager.place_spot_order(spot_symbol, "Buy", qty, tp_price, reference_price=last_price)
+            if not order:
+                self.notifier.send_telegram(f"ORDER FAILED: {spot_symbol}")
+                return
+            order_id = str(order.get("orderId") or order.get("result", {}).get("orderId") or f"UNKWN-{spot_symbol}")
+            avail_qty = self.order_manager.get_available_base_qty(spot_symbol, max_wait_s=6.0)
+            if avail_qty <= 0.0:
+                avail_qty = self.order_manager.get_filled_base_qty(spot_symbol, order_id, max_wait_s=6.0)
+            if avail_qty <= 0.0:
+                avail_qty = qty
+            safe_qty = self.order_manager.adjust_qty_for_safety(spot_symbol, avail_qty)
+            tp_resp = self.order_manager.place_tp_limit(spot_symbol, safe_qty, tp_price)
+            if not tp_resp:
+                self.notifier.send_telegram(f"TP PLACE FAILED: {spot_symbol}")
+            self.db.insert_trade(rec.id, order_id, "Buy", safe_qty, last_price, tp_price, "open", stop_loss_price=None)
+            self.db.insert_signal(rec.id, 0.0, 0.0, action_taken="bought")
+            self.notifier.send_telegram(f"TG ORDER: {spot_symbol} qty={safe_qty} entry={last_price:.6f} tp={tp_price:.6f}")
+            self.logger.info(f"TG ORDER PLACED: {spot_symbol} - Qty: {safe_qty}, TP: {tp_price}")
+        except Exception as e:
+            self.logger.error(f"Telegram signal handling error: {e}")
+
+    def _maybe_sync_orders_periodically(self) -> None:
+        now = time.time()
+        if now - self._last_sync_time >= 30.0:  # every 30s
+            try:
+                self.order_manager.sync_recent_orders()
+            except Exception as e:
+                self.logger.error(f"Periodic order sync failed: {e}")
+            self._last_sync_time = now 
+            # Monitor for breakeven exits: if a trade is closed but TP did not trigger, consider SL/breakeven
+            try:
+                # For simplicity: check open trades list shrink; notify on close without TP hit
+                pass
+            except Exception as e:
+                self.logger.debug(f"Breakeven monitor error: {e}")
+
+    def _activate_runtime_emergency(self) -> None:
+        self._runtime_emergency_stop = True
+        # Red text with cross
+        try:
+            print("\x1b[31m✖ Emergency stop activated by Telegram command\x1b[0m")
+        except Exception:
+            pass
+        self.logger.error("Emergency stop activated by Telegram command")
+        self.notifier.send_telegram("EMERGENCY STOP: Activated by command") 
+
+    def _deactivate_runtime_emergency(self) -> None:
+        self._runtime_emergency_stop = False
+        try:
+            print("\x1b[32m✔ Trading resumed by Telegram command\x1b[0m")
+        except Exception:
+            pass
+        self.logger.info("Trading resumed by Telegram command")
+        self.notifier.send_telegram("RESUME: Trading resumed by command") 
