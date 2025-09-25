@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Optional
 
+import os
 from bybit_trading_bot.utils.logger import get_logger
-from bybit_trading_bot.utils.http_client import RateLimitedHTTP
+from bybit_trading_bot.utils.http_client import RateLimitedHTTP, MEXCHTTP
 
 try:
     from pybit.unified_trading import HTTP
@@ -16,10 +17,19 @@ class FuturesHandler:
         self.logger = get_logger(self.__class__.__name__)
         self._raw_http = None
         self._http = None
-        if HTTP is not None:
+        prefer_mexc = os.getenv("EXCHANGE", "").strip().lower() == "mexc" or bool(os.getenv("MEXC_API_KEY"))
+        if prefer_mexc:
+            try:
+                self._raw_http = MEXCHTTP(os.getenv("MEXC_API_KEY"), os.getenv("MEXC_API_SECRET"))
+                self._http = RateLimitedHTTP(self._raw_http, max_requests=90, per_seconds=3.0)
+                self.logger.info("FuturesHandler using MEXC HTTP adapter")
+            except Exception as e:
+                self.logger.error(f"Failed to init MEXC HTTP for futures: {e}")
+        if self._http is None and HTTP is not None:
             try:
                 self._raw_http = HTTP(testnet=testnet)
                 self._http = RateLimitedHTTP(self._raw_http, max_requests=90, per_seconds=3.0)
+                self.logger.info("FuturesHandler using Bybit HTTP client")
             except Exception as e:
                 self.logger.error(f"Failed to init HTTP for futures: {e}")
 

@@ -14,6 +14,8 @@ class Config:
     bybit_api_key: Optional[str]
     bybit_api_secret: Optional[str]
     bybit_testnet: bool
+    mexc_api_key: Optional[str]
+    mexc_api_secret: Optional[str]
 
     max_position_size_percent: float
     max_simultaneous_positions: int
@@ -83,6 +85,8 @@ def load_settings() -> Config:
     bybit_api_key = os.getenv("BYBIT_API_KEY")
     bybit_api_secret = os.getenv("BYBIT_API_SECRET")
     bybit_testnet = _get_bool(os.getenv("BYBIT_TESTNET"), True)
+    mexc_api_key = os.getenv("MEXC_API_KEY")
+    mexc_api_secret = os.getenv("MEXC_API_SECRET")
 
     max_position_size_percent = float(os.getenv("MAX_POSITION_SIZE_PERCENT", "1.0"))
     max_simultaneous_positions = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "3"))
@@ -149,6 +153,8 @@ def load_settings() -> Config:
         bybit_api_key=bybit_api_key,
         bybit_api_secret=bybit_api_secret,
         bybit_testnet=bybit_testnet,
+        mexc_api_key=mexc_api_key,
+        mexc_api_secret=mexc_api_secret,
         max_position_size_percent=max_position_size_percent,
         max_simultaneous_positions=max_simultaneous_positions,
         price_change_threshold=price_change_threshold,

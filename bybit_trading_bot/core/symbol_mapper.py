@@ -5,7 +5,7 @@ from typing import Dict, List, Set
 from bybit_trading_bot.config.settings import Config
 from bybit_trading_bot.utils.logger import get_logger
 from bybit_trading_bot.utils.db_manager import DBManager
-from bybit_trading_bot.utils.http_client import RateLimitedHTTP
+from bybit_trading_bot.utils.http_client import RateLimitedHTTP, MEXCHTTP
 
 try:
     from pybit.unified_trading import HTTP
@@ -22,12 +22,19 @@ class SymbolMapper:
         self.logger = get_logger(self.__class__.__name__)
         self._raw_http = None
         self._http = None
-        if HTTP is not None:
+        if HTTP is not None and self.config.bybit_api_key and self.config.bybit_api_secret:
             try:
                 self._raw_http = HTTP(testnet=self.config.bybit_testnet)
                 self._http = RateLimitedHTTP(self._raw_http, max_requests=90, per_seconds=3.0)
             except Exception as e:
                 self.logger.warning(f"Failed to init Bybit HTTP client: {e}")
+        if self._http is None:
+            try:
+                self._raw_http = MEXCHTTP(self.config.mexc_api_key, self.config.mexc_api_secret)
+                self._http = RateLimitedHTTP(self._raw_http, max_requests=90, per_seconds=3.0)
+                self.logger.info("SymbolMapper using MEXC HTTP adapter")
+            except Exception as e:
+                self.logger.warning(f"Failed to init MEXC HTTP client: {e}")
 
     def _fetch_all_symbols(self, category: str) -> Set[str]:
         if self._http is None:

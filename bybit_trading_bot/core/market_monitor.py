@@ -82,6 +82,21 @@ class MarketMonitor:
                 if usdt:
                     bal = usdt[0].get('availableToTrade') or usdt[0].get('availableToWithdraw') or usdt[0].get('walletBalance')
                     balance_str = str(bal)
+            else:
+                # MEXC wallet balance only if keys present to avoid retry/backoff
+                if self.config.mexc_api_key and self.config.mexc_api_secret:
+                    try:
+                        from bybit_trading_bot.utils.http_client import RateLimitedHTTP, MEXCHTTP  # local import to avoid cycle
+                        mexc_http = RateLimitedHTTP(MEXCHTTP(self.config.mexc_api_key, self.config.mexc_api_secret), max_requests=60, per_seconds=2.0)
+                        d = mexc_http.request('get_wallet_balance', accountType='spot')
+                        lst = (d or {}).get('result', {}).get('list', [])
+                        coins = lst[0].get('coin', []) if lst else []
+                        usdt = [c for c in coins if str(c.get('coin')).upper() == 'USDT']
+                        if usdt:
+                            bal = usdt[0].get('availableToTrade') or usdt[0].get('availableToWithdraw') or usdt[0].get('walletBalance')
+                            balance_str = str(bal)
+                    except Exception:
+                        pass
             total_pnl = self.db.get_total_pnl()
             # ROI% относительно текущего баланса, если доступен
             roi = None

@@ -7,7 +7,7 @@ import time
 from bybit_trading_bot.config.settings import Config
 from bybit_trading_bot.utils.logger import get_logger
 from bybit_trading_bot.utils.db_manager import DBManager
-from bybit_trading_bot.utils.http_client import RateLimitedHTTP
+from bybit_trading_bot.utils.http_client import RateLimitedHTTP, MEXCHTTP
 
 try:
     from pybit.unified_trading import HTTP
@@ -25,7 +25,7 @@ class OrderManager:
         self._raw_http = None
         self._http = None
         self._symbol_cache: Dict[str, Dict[str, Decimal | str]] = {}
-        if HTTP is not None:
+        if HTTP is not None and self.config.bybit_api_key and self.config.bybit_api_secret:
             try:
                 self._raw_http = HTTP(
                     testnet=self.config.bybit_testnet,
@@ -35,6 +35,14 @@ class OrderManager:
                 self._http = RateLimitedHTTP(self._raw_http, max_requests=90, per_seconds=3.0)
             except Exception as e:
                 self.logger.error(f"Failed to init Bybit HTTP trading client: {e}")
+        # Prefer MEXC if keys provided or Bybit unavailable
+        if self._http is None and (self.config.mexc_api_key or self.config.mexc_api_secret):
+            try:
+                self._raw_http = MEXCHTTP(self.config.mexc_api_key, self.config.mexc_api_secret)
+                self._http = RateLimitedHTTP(self._raw_http, max_requests=90, per_seconds=3.0)
+                self.logger.info("OrderManager using MEXC HTTP adapter")
+            except Exception as e:
+                self.logger.error(f"Failed to init MEXC HTTP trading client: {e}")
 
     def _get_symbol_filters(self, symbol: str) -> Dict[str, Decimal | str]:
         if symbol in self._symbol_cache:
@@ -209,6 +217,11 @@ class OrderManager:
 
     def place_spot_order(self, symbol: str, side: str, quantity: float, take_profit: float, reference_price: float, stop_loss: Optional[float] = None) -> Optional[Dict]:
         try:
+            # Guard: require MEXC keys for live orders when using MEXC adapter
+            if self._http is not None and isinstance(self._raw_http, MEXCHTTP):
+                if not (self.config.mexc_api_key and self.config.mexc_api_secret):
+                    self.logger.error(f"❌ ORDER FAILED: {symbol} - MEXC API keys not configured")
+                    return None
             filters = self._get_symbol_filters(symbol)
             if side.lower() == "buy":
                 if self.config.spot_market_unit == "quote":
@@ -250,7 +263,6 @@ class OrderManager:
             kwargs = dict(category="spot", symbol=symbol, side=side, orderType="Market", qty=qty_field)
             if market_unit:
                 kwargs["marketUnit"] = market_unit
-            # No preset SL is sent for spot marketUnit=quoteCoin.
             resp = self._http.request("place_order", **kwargs)
             if not self._is_success(resp):
                 self.logger.error(f"❌ ORDER FAILED: {symbol} - API retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
@@ -346,7 +358,7 @@ class OrderManager:
                 timeInForce="GTC",
             )
             if self.config.post_only_tp:
-                kwargs["isPostOnly"] = True  # Bybit V5 supports isPostOnly flag
+                kwargs["isPostOnly"] = True  # MEXC maps to timeInForce=PO internally
             resp = self._http.request("place_order", **kwargs)
             if not self._is_success(resp):
                 self.logger.error(f"Failed to place TP limit for {symbol}: retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
@@ -370,7 +382,7 @@ class OrderManager:
                 return None
             qty_str = self._normalize_and_format_qty(symbol, base_qty, None)
             trigger = self._format_price(symbol, sl_price)
-            # Prefer Stop-Market on trigger to ensure exit even при резком падении
+            # Prefer Stop-Market on trigger
             kwargs_market = dict(
                 category="spot",
                 symbol=symbol,
@@ -469,21 +481,6 @@ class OrderManager:
                 time.sleep(0.5)
         return last_row
 
-    def get_order_fill_row(self, order_id: str) -> Optional[Dict]:
-        """Single request to fetch order history row by id; returns row dict if exists."""
-        if self._http is None:
-            return None
-        try:
-            resp = self._http.request("get_order_history", category="spot", orderId=order_id)
-            if int(resp.get("retCode", -1)) != 0:
-                return None
-            rows = (resp.get("result", {}) or {}).get("list", [])
-            if rows:
-                return rows[0]
-            return None
-        except Exception:
-            return None
-
     def get_order_fill_row(self, order_id: str, max_retries: int = 3) -> Optional[Dict]:
         """Fetch order history row by id with simple retry/backoff."""
         if self._http is None:
@@ -520,7 +517,6 @@ class OrderManager:
             sl_price = entry_f * (1.0 - float(sl_pct))
             safe_qty = self.adjust_qty_for_safety(symbol, qty_f)
             self.place_tp_limit(symbol, safe_qty, tp_price)
-            # Place exchange SL only if supported/desired
             if sl_pct > 0.0:
                 self.place_sl_stop_limit(symbol, safe_qty, sl_price)
         except Exception as e:
@@ -590,6 +586,9 @@ class OrderManager:
         when their orderId is not present among exchange open orders.
         """
         if self._http is None:
+            return
+        # Skip entirely on MEXC to avoid signed calls/backoffs here; cancels are handled per-trade operations
+        if isinstance(self._raw_http, MEXCHTTP):
             return
         try:
             resp = self._http.request("get_open_orders", category="spot")

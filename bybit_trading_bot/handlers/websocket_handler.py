@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional
 
+import os
 from bybit_trading_bot.utils.logger import get_logger
+from bybit_trading_bot.utils.http_client import RateLimitedHTTP, MEXCHTTP
 
 try:
     from pybit.unified_trading import WebSocket
@@ -42,16 +44,35 @@ class WebSocketHandler:
         self._backoff_cap = 30.0
         self._stale_seconds = 15.0  # no ticks for this duration → reconnect
 
-        if WebSocket is not None:
+        # REST polling fallback (MEXC)
+        self._http: Optional[RateLimitedHTTP] = None
+        self._poll_thread: Optional[threading.Thread] = None
+
+        prefer_rest = os.getenv("EXCHANGE", "").strip().lower() == "mexc" or bool(os.getenv("MEXC_API_KEY"))
+        if not prefer_rest and WebSocket is not None:
             try:
                 self._ws = WebSocket(testnet=self.testnet, channel_type="spot")
             except Exception as e:
                 self.logger.error(f"Failed to init WebSocket: {e}")
+        if self._ws is None:
+            try:
+                mexc = MEXCHTTP(api_key=None, api_secret=None)
+                self._http = RateLimitedHTTP(mexc, max_requests=120, per_seconds=1.0)
+                self.logger.info("WS fallback: using MEXC REST polling for tickers")
+            except Exception as e:
+                self.logger.error(f"Failed to init REST polling fallback: {e}")
 
     def connect_to_spot_stream(self, symbols: List[str], on_ticker: Optional[TickerCallback] = None) -> None:
         """Подключение к потоку спот-данных (тикеры) и запуск мониторинга."""
         if self._ws is None:
-            self.logger.warning("WebSocket not available; running in stub mode")
+            # Start REST polling fallback for tickers
+            with self._lock:
+                self._symbols = list(symbols)
+                self._on_ticker = on_ticker
+            if self._poll_thread is None:
+                self._poll_thread = threading.Thread(target=self._poll_loop, name="WSPoll", daemon=True)
+                self._poll_thread.start()
+            self.logger.warning("WebSocket not available; started REST polling fallback")
             return
         with self._lock:
             self._symbols = list(symbols)
@@ -67,6 +88,34 @@ class WebSocketHandler:
         if self._monitor_thread is None:
             self._monitor_thread = threading.Thread(target=self._monitor_loop, name="WSMonitor", daemon=True)
             self._monitor_thread.start()
+
+    def _poll_loop(self) -> None:
+        self.logger.info("REST polling loop started")
+        while not self._stop_event.is_set():
+            try:
+                with self._lock:
+                    symbols = list(self._symbols)
+                    cb = self._on_ticker
+                now = time.time()
+                for sym in symbols:
+                    price: Optional[float] = None
+                    try:
+                        if self._http is not None:
+                            resp = self._http.request("get_tickers", category="spot", symbol=sym)
+                            # MEXC /api/v3/ticker/price returns {symbol, price}
+                            if isinstance(resp, dict):
+                                p = resp.get("price") or (resp.get("result", {}).get("list", [{}])[0].get("lastPrice") if resp.get("result") else None)
+                                if p is not None:
+                                    price = float(p)
+                    except Exception:
+                        price = None
+                    if price is not None and callable(cb):
+                        cb(sym, price, now)
+                        self._last_tick_time = now
+                time.sleep(1.0)
+            except Exception as e:
+                self.logger.debug(f"REST polling error: {e}")
+                time.sleep(1.0)
 
     def subscribe_orderbook_and_trades(
         self,
