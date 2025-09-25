@@ -362,7 +362,13 @@ class OrderManager:
         if not self.config.place_exchange_sl or self._http is None:
             return None
         try:
-            qty_str = self._normalize_and_format_qty(symbol, quantity, None)
+            # Cap by currently available base balance to avoid 170131 (reserved by TP)
+            available = self.get_available_base_qty(symbol, max_wait_s=3.0)
+            base_qty = min(max(0.0, quantity), max(0.0, available))
+            if base_qty <= 0.0:
+                self.logger.info(f"Skip SL for {symbol}: no available base balance (likely reserved by TP)")
+                return None
+            qty_str = self._normalize_and_format_qty(symbol, base_qty, None)
             trigger = self._format_price(symbol, sl_price)
             # Prefer Stop-Market on trigger to ensure exit even при резком падении
             kwargs_market = dict(
