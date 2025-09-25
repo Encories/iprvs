@@ -211,22 +211,26 @@ class OrderManager:
         try:
             filters = self._get_symbol_filters(symbol)
             if side.lower() == "buy":
-                notional = self.config.trade_notional_usdt or float(Decimal(str(quantity)) * Decimal(str(reference_price)))
-                min_notional = float(filters["min_notional"]) if filters["min_notional"] > 0 else 0.0
-                if min_notional > 0 and notional < min_notional:
-                    if self.config.skip_below_min_notional:
-                        self.logger.warning(
-                            f"Skipping order {symbol}: notional {notional} < minOrderAmt {min_notional} and SKIP_BELOW_MIN_NOTIONAL=True"
-                        )
-                        try:
-                            self.db.set_symbol_active(symbol, False)
-                            self.logger.info(f"Deactivated symbol {symbol} due to min notional skip")
-                        except Exception as e:
-                            self.logger.debug(f"Failed to deactivate {symbol}: {e}")
-                        return None
-                    notional = min_notional + float(filters["quote_step"])  # type: ignore[index]
-                qty_field = self._format_quote_amount(symbol, notional)
-                market_unit = "quoteCoin"
+                if getattr(self.config, "spot_market_unit", "base") == "quote":
+                    notional = self.config.trade_notional_usdt or float(Decimal(str(quantity)) * Decimal(str(reference_price)))
+                    min_notional = float(filters["min_notional"]) if filters["min_notional"] > 0 else 0.0
+                    if min_notional > 0 and notional < min_notional:
+                        if self.config.skip_below_min_notional:
+                            self.logger.warning(
+                                f"Skipping order {symbol}: notional {notional} < minOrderAmt {min_notional} and SKIP_BELOW_MIN_NOTIONAL=True"
+                            )
+                            try:
+                                self.db.set_symbol_active(symbol, False)
+                                self.logger.info(f"Deactivated symbol {symbol} due to min notional skip")
+                            except Exception as e:
+                                self.logger.debug(f"Failed to deactivate {symbol}: {e}")
+                            return None
+                        notional = min_notional + float(filters["quote_step"])  # type: ignore[index]
+                    qty_field = self._format_quote_amount(symbol, notional)
+                    market_unit = "quoteCoin"
+                else:
+                    qty_field = self._normalize_and_format_qty(symbol, quantity, reference_price)
+                    market_unit = None
             else:
                 qty_field = self._normalize_and_format_qty(symbol, quantity, None)
                 market_unit = None
@@ -458,6 +462,25 @@ class OrderManager:
             except Exception:
                 time.sleep(0.5)
         return last_row
+
+    def get_order_fill_row(self, order_id: str) -> Optional[Dict]:
+        """Single request to fetch order history row by id; returns row dict if exists."""
+        if self._http is None:
+            return None
+        try:
+            resp = self._http.request("get_order_history", category="spot", orderId=order_id)
+            if int(resp.get("retCode", -1)) != 0:
+                return None
+            rows = (resp.get("result", {}) or {}).get("list", [])
+            if rows:
+                return rows[0]
+            return None
+        except Exception:
+            return None
+
+    def sync_recent_orders(self) -> None:
+        """Placeholder to avoid runtime errors; can be extended to sync fills in batch."""
+        return
 
     def post_fill_tp_sl(self, symbol: str, filled_row: Dict, tp_pct: float, sl_pct: float) -> None:
         """After a buy fill, place TP limit (+pct) and SL stop-limit (-pct)."""

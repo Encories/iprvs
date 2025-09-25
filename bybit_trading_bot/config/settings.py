@@ -67,6 +67,7 @@ class Config:
     split_trading_pairs: Optional[str]
     # Fees
     fee_rate: float
+    drawdown_exit_threshold_pct: float
 
 
 def _get_bool(value: str | None, default: bool) -> bool:
@@ -136,6 +137,7 @@ def load_settings() -> Config:
     split_max_open_orders = int(os.getenv("SPLIT_MAX_OPEN_ORDERS", "3"))
     split_trading_pairs = os.getenv("SPLIT_TRADING_PAIRS")
     fee_rate = float(os.getenv("FEE_RATE", "0.001"))
+    drawdown_exit_threshold_pct = float(os.getenv("DRAWDOWN_EXIT_THRESHOLD_PCT", "10.0"))
 
     return Config(
         bybit_api_key=bybit_api_key,
@@ -187,4 +189,5 @@ def load_settings() -> Config:
         split_max_open_orders=split_max_open_orders,
         split_trading_pairs=split_trading_pairs,
         fee_rate=fee_rate,
+        drawdown_exit_threshold_pct=drawdown_exit_threshold_pct,
     ) 

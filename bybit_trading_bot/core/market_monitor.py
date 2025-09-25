@@ -334,6 +334,11 @@ class MarketMonitor:
                     fee_entry = None
                 if fqty > 0.0:
                     safe_qty = self.order_manager.adjust_qty_for_safety(symbol, fqty)
+                    # ensure trade record exists before updates
+                    try:
+                        self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, avg, tp_price, "open", stop_loss_price=None)
+                    except Exception:
+                        pass
                     tp_resp = self.order_manager.place_tp_limit(symbol, safe_qty, tp_price)
                     try:
                         tp_id = str(tp_resp.get("orderId") or tp_resp.get("result", {}).get("orderId") ) if tp_resp else None
@@ -585,8 +590,6 @@ class MarketMonitor:
                     time.sleep(2.0)
                     continue
                 for rec in symbols:
-                    # Verbose: print which pair is being analyzed
-                    self.logger.info(f"Analyzing: {rec.spot_symbol}")
                     ok, pchg, oichg = self.check_trading_conditions(rec.id)
                     # lightweight observability: log when near thresholds
                     if not ok and (pchg >= self.config.price_change_threshold * 0.8 or oichg >= self.config.oi_change_threshold * 0.8):
@@ -636,6 +639,44 @@ class MarketMonitor:
                 if last_price >= tr.take_profit_price:
                     symbol = symbols_by_id.get(tr.symbol_id, "")
                     if symbol:
+                        # Prefer sync with existing TP order if it's already filled
+                        try:
+                            if getattr(tr, "tp_order_id", None):
+                                row = self.order_manager.get_order_fill_row(str(tr.tp_order_id))
+                                if row and str(row.get("orderStatus", "")).lower() == "filled":
+                                    close_price = float(row.get("avgPrice") or row.get("price") or tr.take_profit_price)
+                                    try:
+                                        fee_rate = float(self.config.fee_rate)
+                                    except Exception:
+                                        fee_rate = 0.001
+                                    fee_entry = tr.entry_price * tr.quantity * fee_rate
+                                    fee_exit = close_price * tr.quantity * fee_rate
+                                    pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
+                                    self.db.close_trade(tr.order_id, pnl_net)
+                                    try:
+                                        close_id = str(row.get("orderId"))
+                                        if close_id:
+                                            self.db.set_trade_close_info(tr.order_id, close_id, close_price)
+                                        self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
+                                        # cancel leftover SL if any
+                                        try:
+                                            if getattr(tr, "sl_order_id", None):
+                                                self.order_manager.cancel_order(symbol, str(tr.sl_order_id))
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                    notional = tr.entry_price * tr.quantity
+                                    pct = (pnl_net / notional * 100.0) if notional > 0 else 0.0
+                                    msg = f"TP HIT (SYNC): {symbol} qty={tr.quantity} close={close_price:.6f} pnl_net={pnl_net:.4f} ({pct:.2f}%)"
+                                    try:
+                                        self.notifier.send_telegram(msg)
+                                    except Exception:
+                                        pass
+                                    self.logger.info(msg)
+                                    continue
+                        except Exception:
+                            pass
                         resp = self.order_manager.close_position_market(symbol, tr.quantity)
                         if resp:
                             pnl_gross = (tr.take_profit_price - tr.entry_price) * tr.quantity
@@ -673,16 +714,46 @@ class MarketMonitor:
                                 self.notifier.send_telegram(msg)
                             except Exception:
                                 pass
-                            self.notifier.send_telegram(msg)
                             self.logger.info(
                                 f"TP hit: symbol_id={tr.symbol_id} closed {tr.quantity} at {last_price} (TP {tr.take_profit_price}) net={pnl_net:.4f} ({pct:.2f}%)"
                             )
                         else:
                             self.logger.error(f"TP close failed for {symbol} (order_id={tr.order_id}) - will retry")
                     continue
-                # Emergency drawdown SL: if price falls >= 10% from entry, market exit
+                # Ensure BE SL exists for filled orders even if initial fill was slow (delayed placement)
                 try:
-                    threshold_pct = 10.0  # fixed drawdown threshold
+                    if self.config.place_exchange_sl and not getattr(tr, "sl_order_id", None):
+                        row = self.order_manager.get_order_fill_row(str(tr.order_id))
+                        if row and str(row.get("orderStatus", "")).lower() == "filled":
+                            # update entry/qty if needed and place BE SL
+                            try:
+                                avg = float(row.get("avgPrice") or row.get("price") or tr.entry_price)
+                                qty = float(row.get("cumExecQty") or row.get("qty") or tr.quantity)
+                                self.db.update_trade_entry_qty(tr.order_id, avg, qty)
+                            except Exception:
+                                avg = tr.entry_price
+                                qty = tr.quantity
+                            r = float(self.config.fee_rate)
+                            be_price = avg * (1.0 + r) / max(1e-12, (1.0 - r))
+                            symbol = symbols_by_id.get(tr.symbol_id, "")
+                            if symbol:
+                                sl_resp = self.order_manager.place_sl_stop_limit(symbol, qty, be_price)
+                                try:
+                                    sl_id = str(sl_resp.get("orderId") or sl_resp.get("result", {}).get("orderId")) if sl_resp else None
+                                except Exception:
+                                    sl_id = None
+                                if sl_id:
+                                    self.db.set_trade_sl_order(tr.order_id, sl_id, be_price)
+                                    try:
+                                        self.notifier.send_telegram(f"BE SL PLACED (DELAYED): {symbol} trigger={be_price:.6f}")
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
+
+                # Emergency drawdown SL: if price falls >= configured threshold from entry, market exit
+                try:
+                    threshold_pct = float(self.config.drawdown_exit_threshold_pct)
                     if tr.entry_price > 0:
                         drop_pct = (last_price - tr.entry_price) / tr.entry_price * 100.0
                         if drop_pct <= -abs(threshold_pct):
@@ -734,6 +805,66 @@ class MarketMonitor:
                             continue
                 except Exception as e:
                     self.logger.debug(f"Drawdown SL error: {e}")
+
+                # If we have protective SL/TP orders and they filled outside our polling windows, detect via order history
+                try:
+                    if getattr(tr, "tp_order_id", None):
+                        row = self.order_manager.get_order_fill_row(str(tr.tp_order_id))
+                        if row and str(row.get("orderStatus", "")).lower() == "filled":
+                            symbol = symbols_by_id.get(tr.symbol_id, "")
+                            close_price = float(row.get("avgPrice") or row.get("price") or tr.take_profit_price)
+                            # net pnl with fees
+                            try:
+                                fee_rate = float(self.config.fee_rate)
+                            except Exception:
+                                fee_rate = 0.001
+                            fee_entry = tr.entry_price * tr.quantity * fee_rate
+                            fee_exit = close_price * tr.quantity * fee_rate
+                            pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
+                            self.db.close_trade(tr.order_id, pnl_net)
+                            try:
+                                close_id = str(row.get("orderId"))
+                                if close_id:
+                                    self.db.set_trade_close_info(tr.order_id, close_id, close_price)
+                                self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
+                            except Exception:
+                                pass
+                            msg = f"TP HIT (SYNC): {symbol} qty={tr.quantity} close={close_price:.6f} pnl_net={pnl_net:.4f}"
+                            try:
+                                self.notifier.send_telegram(msg)
+                            except Exception:
+                                pass
+                            self.logger.info(msg)
+                            continue
+                    if getattr(tr, "sl_order_id", None):
+                        row = self.order_manager.get_order_fill_row(str(tr.sl_order_id))
+                        if row and str(row.get("orderStatus", "")).lower() == "filled":
+                            symbol = symbols_by_id.get(tr.symbol_id, "")
+                            close_price = float(row.get("avgPrice") or row.get("price") or (tr.sl_price or tr.entry_price))
+                            try:
+                                fee_rate = float(self.config.fee_rate)
+                            except Exception:
+                                fee_rate = 0.001
+                            fee_entry = tr.entry_price * tr.quantity * fee_rate
+                            fee_exit = close_price * tr.quantity * fee_rate
+                            pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
+                            self.db.close_trade(tr.order_id, pnl_net)
+                            try:
+                                close_id = str(row.get("orderId"))
+                                if close_id:
+                                    self.db.set_trade_close_info(tr.order_id, close_id, close_price)
+                                self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
+                            except Exception:
+                                pass
+                            msg = f"BREAKEVEN EXIT (SYNC): {symbol} qty={tr.quantity} close={close_price:.6f} pnl_net={pnl_net:.4f}"
+                            try:
+                                self.notifier.send_telegram(msg)
+                            except Exception:
+                                pass
+                            self.logger.info(msg)
+                            continue
+                except Exception as e:
+                    self.logger.debug(f"Order history sync error: {e}")
         except Exception as e:
             self.logger.error(f"TP/SL monitor error: {e}")
 
