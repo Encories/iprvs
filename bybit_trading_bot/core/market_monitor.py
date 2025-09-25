@@ -99,6 +99,63 @@ class MarketMonitor:
             self.logger.error(f"Build rate report error: {e}")
             return "Rate error"
 
+    def _close_position_with_pnl(
+        self,
+        trade,
+        symbol: str,
+        close_price: float,
+        close_reason: str,
+        close_order_id: str | None = None,
+    ) -> None:
+        """Unified close: calculates net PnL with fees, updates DB, cancels residual TP/SL, and notifies."""
+        try:
+            try:
+                fee_rate = float(self.config.fee_rate)
+            except Exception:
+                fee_rate = 0.001
+            fee_entry = trade.entry_price * trade.quantity * fee_rate
+            fee_exit = close_price * trade.quantity * fee_rate
+            pnl_net = (close_price - trade.entry_price) * trade.quantity - (fee_entry + fee_exit)
+            self.db.close_trade(trade.order_id, pnl_net)
+            if close_order_id:
+                try:
+                    self.db.set_trade_close_info(trade.order_id, close_order_id, close_price)
+                    self.db.update_trade_fees(trade.order_id, fee_exit=fee_exit)
+                except Exception:
+                    pass
+            # best-effort cancel protective orders
+            try:
+                if getattr(trade, "tp_order_id", None):
+                    self.order_manager.cancel_order(symbol, str(trade.tp_order_id))
+                if getattr(trade, "sl_order_id", None):
+                    self.order_manager.cancel_order(symbol, str(trade.sl_order_id))
+            except Exception:
+                pass
+            notional = trade.entry_price * trade.quantity
+            pct = (pnl_net / notional * 100.0) if notional > 0 else 0.0
+            msg = f"{close_reason}: {symbol} qty={trade.quantity} close={close_price:.6f} pnl_net={pnl_net:.4f} ({pct:.2f}%)"
+            try:
+                self.notifier.send_telegram(msg)
+            except Exception:
+                pass
+            self.logger.info(msg)
+        except Exception as e:
+            self.logger.error(f"Unified close error {symbol}: {e}")
+
+    def _log_account_status_on_start(self) -> None:
+        """Log Bybit account connectivity and available USDT balance on startup (trade mode)."""
+        try:
+            report = self._build_rate_report()
+            try:
+                # Print to console for immediate visibility
+                print(report)
+            except Exception:
+                pass
+            for line in (report or "").splitlines():
+                self.logger.info(line)
+        except Exception as e:
+            self.logger.warning(f"Account status check failed: {e}")
+
     # ---- Public API ----
     def start_monitoring(self) -> None:
         """Запуск всех потоков мониторинга."""
@@ -164,6 +221,13 @@ class MarketMonitor:
             self.logger.info(f"Symbol map initialized with {count} entries")
         except Exception as e:
             self.logger.error(f"Failed to create symbol mapping: {e}")
+
+        # Trade mode: print account connectivity and available balance
+        try:
+            if self.config.switch_mode == "trade":
+                self._log_account_status_on_start()
+        except Exception as e:
+            self.logger.debug(f"Startup account status log failed: {e}")
 
         # Subscribe to spot tickers (best-effort, list may be empty offline)
         try:
@@ -334,20 +398,24 @@ class MarketMonitor:
                     fee_entry = None
                 if fqty > 0.0:
                     safe_qty = self.order_manager.adjust_qty_for_safety(symbol, fqty)
-                    # ensure trade record exists before updates
-                    try:
-                        self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, avg, tp_price, "open", stop_loss_price=None)
-                    except Exception:
-                        pass
+                    # Place TP first; if fails — emergency close and abort
                     tp_resp = self.order_manager.place_tp_limit(symbol, safe_qty, tp_price)
+                    if not tp_resp:
+                        try:
+                            self.order_manager.close_position_market(symbol, safe_qty)
+                        except Exception:
+                            pass
+                        self.notifier.send_telegram(f"EMERGENCY CLOSE: {symbol} - failed to place TP")
+                        return
+                    # Create trade only after TP placed successfully
                     try:
                         tp_id = str(tp_resp.get("orderId") or tp_resp.get("result", {}).get("orderId") ) if tp_resp else None
+                        self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, avg, tp_price, "open", stop_loss_price=None, tp_order_id=tp_id)
                     except Exception:
                         tp_id = None
+                    # update entry qty/fees
                     try:
                         self.db.update_trade_entry_qty(order_id, avg, safe_qty)
-                        if tp_id:
-                            self.db.set_trade_tp_order(order_id, tp_id)
                         if fee_entry is not None:
                             self.db.update_trade_fees(order_id, fee_entry=fee_entry)
                     except Exception:
@@ -643,37 +711,15 @@ class MarketMonitor:
                         try:
                             if getattr(tr, "tp_order_id", None):
                                 row = self.order_manager.get_order_fill_row(str(tr.tp_order_id))
-                                if row and str(row.get("orderStatus", "")).lower() == "filled":
+                                if row and str(row.get("orderStatus", "")).lower() in {"filled", "partiallyfilled", "partially_filled"}:
+                                    filled_qty = float(row.get("cumExecQty") or row.get("qty") or tr.quantity)
                                     close_price = float(row.get("avgPrice") or row.get("price") or tr.take_profit_price)
-                                    try:
-                                        fee_rate = float(self.config.fee_rate)
-                                    except Exception:
-                                        fee_rate = 0.001
-                                    fee_entry = tr.entry_price * tr.quantity * fee_rate
-                                    fee_exit = close_price * tr.quantity * fee_rate
-                                    pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
-                                    self.db.close_trade(tr.order_id, pnl_net)
-                                    try:
-                                        close_id = str(row.get("orderId"))
-                                        if close_id:
-                                            self.db.set_trade_close_info(tr.order_id, close_id, close_price)
-                                        self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
-                                        # cancel leftover SL if any
-                                        try:
-                                            if getattr(tr, "sl_order_id", None):
-                                                self.order_manager.cancel_order(symbol, str(tr.sl_order_id))
-                                        except Exception:
-                                            pass
-                                    except Exception:
-                                        pass
-                                    notional = tr.entry_price * tr.quantity
-                                    pct = (pnl_net / notional * 100.0) if notional > 0 else 0.0
-                                    msg = f"TP HIT (SYNC): {symbol} qty={tr.quantity} close={close_price:.6f} pnl_net={pnl_net:.4f} ({pct:.2f}%)"
-                                    try:
-                                        self.notifier.send_telegram(msg)
-                                    except Exception:
-                                        pass
-                                    self.logger.info(msg)
+                                    # If partial fill: close entire position in one go to avoid double-close on the same trade record
+                                    if filled_qty < tr.quantity:
+                                        remaining = max(0.0, tr.quantity - filled_qty)
+                                        if remaining > 0:
+                                            self.order_manager.close_position_market(symbol, remaining)
+                                    self._close_position_with_pnl(tr, symbol, close_price, "TP HIT (SYNC)", str(row.get("orderId")) if row.get("orderId") else None)
                                     continue
                         except Exception:
                             pass
@@ -761,7 +807,6 @@ class MarketMonitor:
                             if symbol:
                                 resp = self.order_manager.close_position_market(symbol, tr.quantity)
                                 if resp:
-                                    # try to fetch filled avg price
                                     try:
                                         close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
                                     except Exception:
@@ -776,30 +821,7 @@ class MarketMonitor:
                                                     close_price = float(cp)
                                         except Exception:
                                             pass
-                                    # net PnL with fees
-                                    try:
-                                        fee_rate = float(self.config.fee_rate)
-                                    except Exception:
-                                        fee_rate = 0.001
-                                    fee_entry = tr.entry_price * tr.quantity * fee_rate
-                                    fee_exit = close_price * tr.quantity * fee_rate
-                                    pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
-                                    self.db.close_trade(tr.order_id, pnl_net)
-                                    try:
-                                        if close_id:
-                                            self.db.set_trade_close_info(tr.order_id, close_id, close_price)
-                                        self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
-                                    except Exception:
-                                        pass
-                                    msg = (
-                                        f"DRAWDOWN EXIT: {symbol} drop={drop_pct:.2f}% qty={tr.quantity} "
-                                        f"entry={tr.entry_price:.6f} close={close_price:.6f} pnl_net={pnl_net:.4f}"
-                                    )
-                                    try:
-                                        self.notifier.send_telegram(msg)
-                                    except Exception:
-                                        pass
-                                    self.logger.info(msg)
+                                    self._close_position_with_pnl(tr, symbol, close_price, f"DRAWDOWN EXIT (drop={drop_pct:.2f}%)", close_id)
                                 else:
                                     self.logger.error(f"Drawdown close failed for {symbol} (order_id={tr.order_id}) - will retry")
                             continue

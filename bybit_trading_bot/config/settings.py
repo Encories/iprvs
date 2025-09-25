@@ -138,6 +138,12 @@ def load_settings() -> Config:
     split_trading_pairs = os.getenv("SPLIT_TRADING_PAIRS")
     fee_rate = float(os.getenv("FEE_RATE", "0.001"))
     drawdown_exit_threshold_pct = float(os.getenv("DRAWDOWN_EXIT_THRESHOLD_PCT", "10.0"))
+    if drawdown_exit_threshold_pct <= 0 or drawdown_exit_threshold_pct > 50:
+        try:
+            print(f"WARNING: Invalid DRAWDOWN_EXIT_THRESHOLD_PCT={drawdown_exit_threshold_pct}, using 10.0%")
+        except Exception:
+            pass
+        drawdown_exit_threshold_pct = 10.0
 
     return Config(
         bybit_api_key=bybit_api_key,

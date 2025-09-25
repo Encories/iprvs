@@ -211,7 +211,7 @@ class OrderManager:
         try:
             filters = self._get_symbol_filters(symbol)
             if side.lower() == "buy":
-                if getattr(self.config, "spot_market_unit", "base") == "quote":
+                if self.config.spot_market_unit == "quote":
                     notional = self.config.trade_notional_usdt or float(Decimal(str(quantity)) * Decimal(str(reference_price)))
                     min_notional = float(filters["min_notional"]) if filters["min_notional"] > 0 else 0.0
                     if min_notional > 0 and notional < min_notional:
@@ -477,6 +477,27 @@ class OrderManager:
             return None
         except Exception:
             return None
+
+    def get_order_fill_row(self, order_id: str, max_retries: int = 3) -> Optional[Dict]:
+        """Fetch order history row by id with simple retry/backoff."""
+        if self._http is None:
+            return None
+        for attempt in range(max_retries):
+            try:
+                resp = self._http.request("get_order_history", category="spot", orderId=order_id)
+                if int(resp.get("retCode", -1)) != 0:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    return None
+                rows = (resp.get("result", {}) or {}).get("list", [])
+                return rows[0] if rows else None
+            except Exception as e:
+                self.logger.debug(f"Order history fetch attempt {attempt+1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                return None
 
     def sync_recent_orders(self) -> None:
         """Placeholder to avoid runtime errors; can be extended to sync fills in batch."""
