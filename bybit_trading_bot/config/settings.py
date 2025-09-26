@@ -33,6 +33,7 @@ class Config:
     signal_window_minutes: int
     min_unique_oi_bars: int
     emergency_stop: bool
+    safety50_enabled: bool
     stop_sl: bool
 
     telegram_enabled: bool
@@ -143,6 +144,7 @@ def load_settings() -> Config:
     signal_window_minutes = int(os.getenv("SIGNAL_WINDOW_MINUTES", "5"))
     min_unique_oi_bars = int(os.getenv("MIN_UNIQUE_OI_BARS", "2"))
     emergency_stop = _get_bool(os.getenv("EMERGENCY_STOP"), False)
+    safety50_enabled = _get_bool(os.getenv("SAFETY50"), True)
     stop_sl = _get_bool(os.getenv("STOP_SL"), False)
 
     telegram_enabled = _get_bool(os.getenv("TELEGRAM_ENABLED"), False)
@@ -232,6 +234,7 @@ def load_settings() -> Config:
         signal_window_minutes=signal_window_minutes,
         min_unique_oi_bars=min_unique_oi_bars,
         emergency_stop=emergency_stop,
+        safety50_enabled=safety50_enabled,
         stop_sl=stop_sl,
         telegram_enabled=telegram_enabled,
         telegram_bot_token=telegram_bot_token,

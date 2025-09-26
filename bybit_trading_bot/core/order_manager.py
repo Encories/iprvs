@@ -691,10 +691,15 @@ class OrderManager:
             
             for tr in open_trades:
                 try:
-                    self.logger.debug(f"SYNC CANCELLATIONS: Checking trade {tr.order_id} (status: {tr.status})")
+                    self.logger.debug(f"SYNC CANCELLATIONS: Checking trade {tr.order_id} (status: {tr.status}, side: {tr.side})")
                     if str(tr.order_id) not in remote_ids:
-                        self.logger.warning(f"SYNC CANCELLATIONS: Marking trade {tr.order_id} as cancelled - not found in exchange orders")
-                        self.db.set_trade_status(tr.order_id, "cancelled")
+                        # Don't mark buy orders as cancelled - they might be filled
+                        # Only mark sell orders (TP/SL) as cancelled
+                        if tr.side and tr.side.upper() == "BUY":
+                            self.logger.debug(f"SYNC CANCELLATIONS: Buy order {tr.order_id} not found in API - likely filled, keeping status")
+                        else:
+                            self.logger.warning(f"SYNC CANCELLATIONS: Marking sell order {tr.order_id} as cancelled - not found in exchange orders")
+                            self.db.set_trade_status(tr.order_id, "cancelled")
                     else:
                         self.logger.debug(f"SYNC CANCELLATIONS: Trade {tr.order_id} found in exchange orders - keeping status")
                 except Exception as e:

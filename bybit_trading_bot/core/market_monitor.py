@@ -73,6 +73,7 @@ class MarketMonitor:
         self._last_analyzer_summary: float = 0.0
         self._last_api_sync_time: float = 0.0
         self._last_panic_check_time: float = 0.0
+        self._panic_notified_orders: set = set()  # Track orders that already got panic notifications
         self._runtime_emergency_stop: bool = False
         self._loss_notify_sent: bool = False
         # In-memory 1m quote-volume buckets per symbol (epoch minute -> USDT volume)
@@ -883,6 +884,8 @@ class MarketMonitor:
                         if getattr(self.config, "panic_sell_enabled", False):
                             ps = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
                             trigger = avg * (1.0 - abs(ps) / 100.0)
+                            # Add order to notified set to prevent duplicate notifications
+                            self._panic_notified_orders.add(order_id)
                             self.notifier.send_telegram(
                                 f"PANIC MONITOR ENABLED: {symbol} entry={avg:.6f} drop={ps:.2f}% trigger={trigger:.6f} — market sell will execute even if TP is open"
                             )
@@ -917,6 +920,8 @@ class MarketMonitor:
                 if getattr(self.config, "panic_sell_enabled", False):
                     ps = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
                     trigger = last_price * (1.0 - abs(ps) / 100.0)
+                    # Add order to notified set to prevent duplicate notifications
+                    self._panic_notified_orders.add(order_id)
                     self.notifier.send_telegram(
                         f"PANIC MONITOR ENABLED: {symbol} entry≈{last_price:.6f} drop={ps:.2f}% trigger≈{trigger:.6f} — market sell will execute even if TP is open"
                     )
@@ -1122,6 +1127,10 @@ class MarketMonitor:
 
     def _check_loss_streak_and_stop(self) -> None:
         try:
+            # Check if safety50 is enabled
+            if not getattr(self.config, "safety50_enabled", True):
+                return
+            
             # Check 10-consecutive losing
             pnls10 = self.db.get_last_closed_pnls(10)
             if len(pnls10) == 10 and all(p < 0 for p in pnls10):
@@ -1642,13 +1651,15 @@ class MarketMonitor:
                                     
                                     self.logger.info(f"PANIC MONITOR: {symbol} entry={tr.entry_price:.6f} drop={panic_threshold:.2f}% trigger={trigger_price:.6f}")
                                     
-                                    # Send notification about panic monitoring
-                                    try:
-                                        self.notifier.send_telegram(
-                                            f"🔍 PANIC MONITOR STARTED: {symbol} entry={tr.entry_price:.6f} drop={panic_threshold:.2f}% trigger={trigger_price:.6f}"
-                                        )
-                                    except Exception:
-                                        pass
+                                    # Send notification about panic monitoring only once per order
+                                    if tr.order_id not in self._panic_notified_orders:
+                                        try:
+                                            self.notifier.send_telegram(
+                                                f"🔍 PANIC MONITOR STARTED: {symbol} entry={tr.entry_price:.6f} drop={panic_threshold:.2f}% trigger={trigger_price:.6f}"
+                                            )
+                                            self._panic_notified_orders.add(tr.order_id)
+                                        except Exception:
+                                            pass
                                 else:
                                     self.logger.debug(f"PANIC MONITOR: Skipping {symbol} - not a buy order (side={tr.side})")
                                     
