@@ -357,58 +357,7 @@ class OrderManager:
             self.logger.error(f"Failed to place TP limit for {symbol}: {e}")
             return None
 
-    def place_sl_stop_limit(self, symbol: str, quantity: float, sl_price: float) -> Optional[Dict]:
-        """Place an exchange SL as Stop-Market (preferred) or Stop-Limit if Market unsupported)."""
-        if not self.config.place_exchange_sl or self._http is None:
-            return None
-        try:
-            # Cap by currently available base balance to avoid 170131 (reserved by TP)
-            available = self.get_available_base_qty(symbol, max_wait_s=3.0)
-            base_qty = min(max(0.0, quantity), max(0.0, available))
-            if base_qty <= 0.0:
-                self.logger.info(f"Skip SL for {symbol}: no available base balance (likely reserved by TP)")
-                return None
-            qty_str = self._normalize_and_format_qty(symbol, base_qty, None)
-            trigger = self._format_price(symbol, sl_price)
-            # Prefer Stop-Market on trigger to ensure exit even при резком падении
-            kwargs_market = dict(
-                category="spot",
-                symbol=symbol,
-                side="Sell",
-                orderType="Market",
-                qty=qty_str,
-                triggerPrice=trigger,
-                triggerDirection=2,
-            )
-            resp = self._http.request("place_order", **kwargs_market)
-            if not self._is_success(resp):
-                # Fallback to Stop-Limit
-                try:
-                    limit_price = trigger
-                    kwargs_limit = dict(
-                        category="spot",
-                        symbol=symbol,
-                        side="Sell",
-                        orderType="Limit",
-                        qty=qty_str,
-                        price=limit_price,
-                        timeInForce="GTC",
-                        triggerPrice=trigger,
-                        triggerDirection=2,
-                        tpslMode="Partial",
-                    )
-                    resp = self._http.request("place_order", **kwargs_limit)
-                    if not self._is_success(resp):
-                        self.logger.error(f"Failed to place SL (market/limit) for {symbol}: retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
-                        return None
-                except Exception as e:
-                    self.logger.error(f"Failed Stop-Limit fallback for {symbol}: {e}")
-                    return None
-            self.logger.info(f"Placed SL protective: {symbol} qty={qty_str} trigger={trigger}")
-            return resp
-        except Exception as e:
-            self.logger.error(f"Failed to place SL stop-limit for {symbol}: {e}")
-            return None
+    # Exchange SL placement removed in favor of Software SL.
 
     # --- Split mode helpers ---
     def place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Optional[Dict]:
@@ -510,19 +459,15 @@ class OrderManager:
         return
 
     def post_fill_tp_sl(self, symbol: str, filled_row: Dict, tp_pct: float, sl_pct: float) -> None:
-        """After a buy fill, place TP limit (+pct) and SL stop-limit (-pct)."""
+        """After a buy fill, place TP limit (+pct). Exchange SL placement removed."""
         try:
             entry = filled_row.get("avgPrice") or filled_row.get("price")
             qty = filled_row.get("cumExecQty") or filled_row.get("qty")
             entry_f = float(entry)
             qty_f = float(qty)
             tp_price = entry_f * (1.0 + float(tp_pct))
-            sl_price = entry_f * (1.0 - float(sl_pct))
             safe_qty = self.adjust_qty_for_safety(symbol, qty_f)
             self.place_tp_limit(symbol, safe_qty, tp_price)
-            # Place exchange SL only if supported/desired
-            if sl_pct > 0.0:
-                self.place_sl_stop_limit(symbol, safe_qty, sl_price)
         except Exception as e:
             self.logger.error(f"post_fill_tp_sl failed for {symbol}: {e}")
 
@@ -550,7 +495,114 @@ class OrderManager:
 
     def close_position_market(self, symbol: str, quantity: float) -> Optional[Dict]:
         try:
-            qty_str = self._normalize_and_format_qty(symbol, quantity, None)
+            # 1) Best-effort: cancel protective TP/SL before closing to free reserved base
+            try:
+                sym_id = None
+                for rec in self.db.get_active_symbols():
+                    if rec.spot_symbol == symbol:
+                        sym_id = rec.id
+                        break
+                if sym_id is not None:
+                    tp_to_wait: str | None = None
+                    sl_to_wait: str | None = None
+                    for tr in self.db.get_open_trades():
+                        if tr.symbol_id == sym_id:
+                            try:
+                                if getattr(tr, "tp_order_id", None):
+                                    tp_to_wait = str(tr.tp_order_id)
+                                    self.cancel_order(symbol, tp_to_wait)
+                            except Exception:
+                                pass
+                            try:
+                                if getattr(tr, "sl_order_id", None):
+                                    sl_to_wait = str(tr.sl_order_id)
+                                    self.cancel_order(symbol, sl_to_wait)
+                            except Exception:
+                                pass
+                            break
+                    # Wait until cancellations take effect (orders disappear from open list)
+                    if self._http is not None and (tp_to_wait or sl_to_wait):
+                        deadline = time.time() + 2.0
+                        while time.time() < deadline:
+                            try:
+                                resp_open = self._http.request("get_open_orders", category="spot", symbol=symbol)
+                                if int(resp_open.get("retCode", -1)) != 0:
+                                    time.sleep(0.1)
+                                    continue
+                                rows = (resp_open.get("result", {}) or {}).get("list", [])
+                                ids = {str(r.get("orderId")) for r in rows if r.get("orderId")}
+                                still = False
+                                if tp_to_wait and tp_to_wait in ids:
+                                    still = True
+                                if sl_to_wait and sl_to_wait in ids:
+                                    still = True
+                                if not still:
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.15)
+            except Exception:
+                pass
+
+            time.sleep(0.25)
+
+            # 2) Ensure notional >= minNotional; wait for wallet refresh after cancellations if needed
+            # Fetch last price and filters
+            last_price: float | None = None
+            try:
+                sym_id = next((rec.id for rec in self.db.get_active_symbols() if rec.spot_symbol == symbol), None)
+            except Exception:
+                sym_id = None
+            if sym_id is not None:
+                try:
+                    p = self.db.get_last_price(sym_id)
+                    if p and p > 0:
+                        last_price = float(p)
+                except Exception:
+                    last_price = None
+            filters = self._get_symbol_filters(symbol)
+            step = filters["qty_step"]  # type: ignore[assignment]
+            min_notional = float(filters["min_notional"]) if filters["min_notional"] > 0 else 0.0
+
+            def _ceil_to_step(val: Decimal, st: Decimal) -> Decimal:
+                steps = (val / st).to_integral_value(rounding=ROUND_DOWN)
+                if (steps * st) < val:
+                    steps = steps + 1
+                return steps * st
+
+            available = self.get_available_base_qty(symbol, max_wait_s=4.0)
+            target_qty = float(quantity)
+            if available > 0.0:
+                target_qty = min(target_qty, available)
+
+            # If we have minNotional and last_price, compute required minimum qty and wait up to 5s if needed
+            if last_price and last_price > 0.0 and min_notional > 0.0:
+                try:
+                    required_qty_dec = _ceil_to_step(Decimal(str(min_notional)) / Decimal(str(last_price)), step)  # type: ignore[name-defined]
+                except Exception:
+                    required_qty_dec = Decimal(str(min_notional / last_price))  # type: ignore[name-defined]
+                try:
+                    required_qty = float(self._format_decimal(required_qty_dec, step))  # type: ignore[arg-type]
+                except Exception:
+                    required_qty = float(required_qty_dec)
+
+                deadline = time.time() + 5.0
+                while target_qty < required_qty and time.time() < deadline:
+                    avail2 = self.get_available_base_qty(symbol, max_wait_s=1.0)
+                    if avail2 > 0.0:
+                        target_qty = min(float(quantity), avail2)
+                    time.sleep(0.2)
+                if target_qty < required_qty:
+                    self.logger.error(
+                        f"Abort close for {symbol}: target_qty={target_qty} < required_min_qty={required_qty} (minNotional={min_notional} price={last_price})"
+                    )
+                    return None
+            target_qty = self.adjust_qty_for_safety(symbol, target_qty)
+            if target_qty <= 0.0:
+                self.logger.error(f"Failed to close position for {symbol}: no available base balance after cancellations")
+                return None
+
+            qty_str = self._normalize_and_format_qty(symbol, target_qty, None)
             if self._http is None:
                 order = {
                     "orderId": f"DEV-CLOSE-{symbol}-{qty_str}",
@@ -569,8 +621,35 @@ class OrderManager:
                 qty=qty_str,
             )
             if not self._is_success(resp):
-                self.logger.error(f"Failed to close position for {symbol}: retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
-                return None
+                # Fallback: brief wait for reservation release and retry once
+                try:
+                    time.sleep(0.3)
+                    # Re-evaluate available and cap once more
+                    available2 = self.get_available_base_qty(symbol, max_wait_s=1.5)
+                    tgt2 = float(target_qty)
+                    if available2 > 0.0:
+                        tgt2 = min(tgt2, available2)
+                    tgt2 = self.adjust_qty_for_safety(symbol, tgt2)
+                    if tgt2 <= 0.0:
+                        self.logger.error(f"Failed to close position for {symbol}: no available base balance on retry")
+                        return None
+                    qty_str2 = self._normalize_and_format_qty(symbol, tgt2, None)
+                    resp2 = self._http.request(
+                        "place_order",
+                        category="spot",
+                        symbol=symbol,
+                        side="Sell",
+                        orderType="Market",
+                        qty=qty_str2,
+                    )
+                    if not self._is_success(resp2):
+                        self.logger.error(f"Failed to close position for {symbol}: retCode={resp2.get('retCode')} retMsg={resp2.get('retMsg')}")
+                        return None
+                    self.logger.info(f"Closed position (retry): {symbol} qty={qty_str2}")
+                    return resp2
+                except Exception as e:
+                    self.logger.error(f"Close fallback failed for {symbol}: {e}")
+                    return None
             self.logger.info(f"Closed position: {symbol} qty={qty_str}")
             return resp
         except Exception as e:

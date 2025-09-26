@@ -4,15 +4,17 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 from bybit_trading_bot.config.settings import Config
 from bybit_trading_bot.utils.logger import get_logger
 from bybit_trading_bot.utils.db_manager import DBManager
 from bybit_trading_bot.utils.notifier import Notifier, TelegramCommandListener
 from bybit_trading_bot.core.data_processor import calculate_percentage_change, meets_thresholds
+from bybit_trading_bot.indicators.technical import calculate_rsi, calculate_macd
 from bybit_trading_bot.core.symbol_mapper import SymbolMapper
 from bybit_trading_bot.core.order_manager import OrderManager
+from bybit_trading_bot.core.software_sl_manager import SoftwareSLManager
 from bybit_trading_bot.handlers.spot_handler import SpotHandler
 from bybit_trading_bot.handlers.futures_handler import FuturesHandler
 from bybit_trading_bot.core.spike_detector import SpikeDetector, SpikeSignal
@@ -56,6 +58,8 @@ class MarketMonitor:
         self.order_manager = OrderManager(self.config, self.db)
         self.notifier = Notifier(self.config)
         self.tg_listener = TelegramCommandListener(self.config, on_stop=self._activate_runtime_emergency, on_rate=self._build_rate_report, on_start=self._deactivate_runtime_emergency, on_signal=self._on_tg_signal)
+        # Software SL manager
+        self.software_sl = SoftwareSLManager(self.config, self.db, self.notifier)
         self.spot = SpotHandler(testnet=self.config.bybit_testnet)
         self.futures = FuturesHandler(testnet=self.config.bybit_testnet)
         # Split mode state
@@ -69,6 +73,8 @@ class MarketMonitor:
         self._last_analyzer_summary: float = 0.0
         self._runtime_emergency_stop: bool = False
         self._loss_notify_sent: bool = False
+        # In-memory 1m quote-volume buckets per symbol (epoch minute -> USDT volume)
+        self._minute_volumes: Dict[str, Dict[int, float]] = {}
 
     def _build_rate_report(self) -> str:
         try:
@@ -123,12 +129,12 @@ class MarketMonitor:
                     self.db.update_trade_fees(trade.order_id, fee_exit=fee_exit)
                 except Exception:
                     pass
-            # best-effort cancel protective orders
+            # best-effort cancel residual TP (exchange SL deprecated)
             try:
                 if getattr(trade, "tp_order_id", None):
-                    self.order_manager.cancel_order(symbol, str(trade.tp_order_id))
-                if getattr(trade, "sl_order_id", None):
-                    self.order_manager.cancel_order(symbol, str(trade.sl_order_id))
+                    # If the close is the TP fill itself, skip cancel to avoid noisy errors
+                    if not (close_order_id and str(close_order_id) == str(trade.tp_order_id)):
+                        self.order_manager.cancel_order(symbol, str(trade.tp_order_id))
             except Exception:
                 pass
             notional = trade.entry_price * trade.quantity
@@ -234,6 +240,18 @@ class MarketMonitor:
             symbols = [rec.spot_symbol for rec in self.db.get_active_symbols()]
             if symbols:
                 self.spot.subscribe_tickers_with_callback(symbols, self._on_spot_ticker)
+                # Also subscribe to public trades to aggregate 1m volumes for RVOL
+                try:
+                    # Use direct ws handler to add trades subscription without orderbook if available
+                    from bybit_trading_bot.handlers.websocket_handler import WebSocketHandler as _WS
+                    if isinstance(self.spot.ws, _WS):
+                        self.spot.ws.subscribe_orderbook_and_trades(symbols, on_orderbook=None, on_trade=self._on_trade_tick)  # type: ignore[attr-defined]
+                except Exception:
+                    # Fallback to SpotHandler composite method
+                    try:
+                        self.spot.subscribe_tickers_with_callback(symbols, self._on_spot_ticker)
+                    except Exception:
+                        pass
         except Exception as e:
             self.logger.error(f"Failed to subscribe tickers: {e}")
 
@@ -242,6 +260,15 @@ class MarketMonitor:
             self.tg_listener.start()
         except Exception as e:
             self.logger.error(f"Failed to start Telegram listener: {e}")
+
+        # Запустить Software SL Manager (если не отключен STOP_SL)
+        try:
+            if not getattr(self.config, "stop_sl", False):
+                self.software_sl.start()
+            else:
+                self.logger.info("Software SL is disabled by STOP_SL flag")
+        except Exception as e:
+            self.logger.error(f"Failed to start Software SL Manager: {e}")
 
         # Initial backfill sync
         # Removed initial order sync to revert last change
@@ -278,6 +305,12 @@ class MarketMonitor:
         self.is_running = False
         self.logger.info("MarketMonitor stopped")
 
+        # Остановить Software SL Manager
+        try:
+            self.software_sl.stop()
+        except Exception:
+            pass
+
     def _can_open_new_position(self, symbol_id: int) -> bool:
         if self.db.count_open_positions() >= self.config.max_simultaneous_positions:
             return False
@@ -299,6 +332,71 @@ class MarketMonitor:
         price_series = self.db.get_recent_price_series(symbol_id, minutes=self.config.signal_window_minutes)
         oi_series = self.db.get_recent_oi_series(symbol_id, minutes=self.config.signal_window_minutes)
         price_change = calculate_percentage_change(price_series)
+
+        # RSI filter (trade mode): block buys on overbought
+        if getattr(self.config, "enable_rsi_filter", False) and self.config.switch_mode == "trade":
+            try:
+                prices_only = [p for (_, p) in price_series]
+                if len(prices_only) >= max(16, int(self.config.rsi_period) + 1):
+                    rsi_vals = calculate_rsi(prices_only, period=int(self.config.rsi_period))
+                    if rsi_vals:
+                        last_rsi = rsi_vals[-1]
+                        if last_rsi >= float(self.config.trade_rsi_overbought):
+                            return False, price_change, 0.0
+            except Exception:
+                pass
+
+        # MACD filter (trade mode): confirm trend, with breakout override
+        if getattr(self.config, "enable_macd_filter", False) and self.config.switch_mode == "trade":
+            try:
+                prices_only = [p for (_, p) in price_series]
+                fast = int(self.config.macd_fast)
+                slow = int(self.config.macd_slow)
+                sig = int(self.config.macd_signal)
+                min_bars = max(1, int(self.config.trade_macd_min_bars))
+                if len(prices_only) >= (slow + sig + min_bars):
+                    macd_line, signal_line = calculate_macd(prices_only, fast=fast, slow=slow, signal=sig)
+                    if macd_line and signal_line:
+                        # breakout override: if price breakout strong, skip MACD filter
+                        breakout_ok = price_change >= self.config.price_only_breakout_threshold
+                        if not breakout_ok:
+                            # require last N bars macd > signal and optionally > 0
+                            ok = True
+                            for i in range(1, min_bars + 1):
+                                if i > len(macd_line) or i > len(signal_line):
+                                    ok = False
+                                    break
+                                if getattr(self.config, "trade_macd_require_above_signal", True):
+                                    if macd_line[-i] <= signal_line[-i]:
+                                        ok = False
+                                        break
+                                if getattr(self.config, "trade_macd_require_above_zero", True):
+                                    if macd_line[-i] <= 0:
+                                        ok = False
+                                        break
+                            if not ok:
+                                return False, price_change, 0.0
+            except Exception:
+                pass
+
+        # RVOL filter (trade mode): require liquidity; allow lower RVOL on breakout
+        if getattr(self.config, "enable_rvol_filter", False) and self.config.switch_mode == "trade":
+            try:
+                symbol = self.db._get_spot_symbol_by_id(symbol_id) or ""
+                if symbol:
+                    rvol = self._compute_rvol(symbol, period=int(self.config.rvol_period))
+                    breakout_ok = price_change >= self.config.price_only_breakout_threshold
+                    threshold = float(self.config.rvol_breakout_min if breakout_ok else self.config.rvol_threshold)
+                    if rvol is None or rvol < threshold:
+                        return False, price_change, 0.0
+                    # Optional absolute liquidity guard over last 5 minutes
+                    min_qv = float(self.config.min_quote_volume_5m_usdt)
+                    if min_qv > 0:
+                        vol5 = self._sum_quote_volume(symbol, 5)
+                        if vol5 < min_qv:
+                            return False, price_change, 0.0
+            except Exception:
+                pass
 
         # Дедуп OI по 5м барам (квантование по времени) и расчёт с учётом настроек
         def _dedup_5m_bars(series: List[Tuple[datetime, float]]) -> List[Tuple[int, float]]:
@@ -420,22 +518,29 @@ class MarketMonitor:
                             self.db.update_trade_fees(order_id, fee_entry=fee_entry)
                     except Exception:
                         pass
-                    # Optionally place exchange SL at break-even to protect from loss
+                    # Добавить Software SL (если не отключен STOP_SL)
                     try:
-                        if self.config.place_exchange_sl:
+                        if self.config.place_exchange_sl and not getattr(self.config, "stop_sl", False):
                             r = float(self.config.fee_rate)
                             be_price = avg * (1.0 + r) / max(1e-12, (1.0 - r))
-                            # если цена уже ниже BE, всё равно ставим триггер на BE, биржа выполнит при возврате
-                            sl_resp = self.order_manager.place_sl_stop_limit(symbol, safe_qty, be_price)
-                            try:
-                                sl_id = str(sl_resp.get("orderId") or sl_resp.get("result", {}).get("orderId")) if sl_resp else None
-                                if sl_id:
-                                    self.db.set_trade_sl_order(order_id, sl_id, be_price)
-                                    self.notifier.send_telegram(f"BE SL PLACED: {symbol} trigger={be_price:.6f}")
-                            except Exception:
-                                pass
+                            self.software_sl.add_sl_position(
+                                trade_id=order_id,
+                                symbol=symbol,
+                                quantity=safe_qty,
+                                entry_price=avg,
+                                sl_price=be_price,
+                            )
+                            delay_s = float(getattr(self.config, "software_sl_activation_delay_seconds", 0.0))
+                            if delay_s > 0:
+                                self.notifier.send_telegram(
+                                    f"SOFTWARE SL SCHEDULED: {symbol} trigger={be_price:.6f} starts_in={int(delay_s)}s"
+                                )
+                            else:
+                                self.notifier.send_telegram(f"SOFTWARE SL ADDED: {symbol} trigger={be_price:.6f}")
+                        elif getattr(self.config, "stop_sl", False):
+                            self.logger.info(f"STOP_SL active: Software SL not added for {symbol}")
                     except Exception as e:
-                        self.logger.debug(f"Place BE SL error {symbol}: {e}")
+                        self.logger.debug(f"Add Software SL error {symbol}: {e}")
                     self.db.insert_signal(symbol_id, price_change, oi_change, action_taken="bought")
                     # expected PnL: gross and net (with fees)
                     try:
@@ -487,6 +592,63 @@ class MarketMonitor:
                 self.db.insert_price(rec.id, price)
         except Exception as e:
             self.logger.debug(f"Failed to persist price for {symbol}: {e}")
+
+    def _on_trade_tick(self, symbol: str, price: float, qty: float, ts: float) -> None:
+        """Aggregate per-trade data into 1m quote-volume buckets in memory."""
+        try:
+            # ts may be in ms; normalize to seconds then to minute index
+            tsec = ts / 1000.0 if ts > 1e11 else ts
+            minute = int(tsec // 60)
+            quote_vol = max(0.0, float(price)) * max(0.0, float(qty))
+            buckets = self._minute_volumes.setdefault(symbol, {})
+            buckets[minute] = buckets.get(minute, 0.0) + quote_vol
+            # trim old buckets beyond max horizon (keep last 120 minutes)
+            if len(buckets) > 200:
+                threshold = minute - 200
+                for k in list(buckets.keys()):
+                    if k < threshold:
+                        buckets.pop(k, None)
+        except Exception:
+            pass
+
+    def _compute_rvol(self, symbol: str, period: int) -> float | None:
+        """Return relative volume ratio = current_minute / avg(previous period minutes)."""
+        try:
+            buckets = self._minute_volumes.get(symbol)
+            if not buckets:
+                return None
+            minutes_sorted = sorted(buckets.keys())
+            if len(minutes_sorted) < period + 1:
+                return None
+            last_min = minutes_sorted[-1]
+            # Collect last period+1 volumes (including current minute)
+            vols: List[float] = []
+            for m in range(last_min - period, last_min + 1):
+                vols.append(float(buckets.get(m, 0.0)))
+            base = vols[:-1]
+            cur = vols[-1]
+            avg = sum(base) / max(1, len(base))
+            if avg <= 0:
+                return None
+            return cur / avg
+        except Exception:
+            return None
+
+    def _sum_quote_volume(self, symbol: str, minutes_back: int) -> float:
+        try:
+            buckets = self._minute_volumes.get(symbol)
+            if not buckets:
+                return 0.0
+            minutes_sorted = sorted(buckets.keys())
+            if not minutes_sorted:
+                return 0.0
+            last_min = minutes_sorted[-1]
+            total = 0.0
+            for m in range(last_min - max(1, minutes_back) + 1, last_min + 1):
+                total += float(buckets.get(m, 0.0))
+            return total
+        except Exception:
+            return 0.0
 
     # ---- Internal workers ----
     def _run_spot_ws(self) -> None:
@@ -720,82 +882,40 @@ class MarketMonitor:
                                         if remaining > 0:
                                             self.order_manager.close_position_market(symbol, remaining)
                                     self._close_position_with_pnl(tr, symbol, close_price, "TP HIT (SYNC)", str(row.get("orderId")) if row.get("orderId") else None)
+                                    try:
+                                        self.software_sl.remove_sl_position(tr.order_id)
+                                    except Exception:
+                                        pass
                                     continue
                         except Exception:
                             pass
                         resp = self.order_manager.close_position_market(symbol, tr.quantity)
                         if resp:
-                            pnl_gross = (tr.take_profit_price - tr.entry_price) * tr.quantity
-                            # approximate fees: entry + exit on quote side
                             try:
-                                fee_rate = float(self.config.fee_rate)
-                            except Exception:
-                                fee_rate = 0.001
-                            fee_entry = tr.entry_price * tr.quantity * fee_rate
-                            fee_exit = tr.take_profit_price * tr.quantity * fee_rate
-                            pnl_net = pnl_gross - (fee_entry + fee_exit)
-                            self.db.close_trade(tr.order_id, pnl_net)
-                            try:
-                                # save close order info if id present
                                 close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
-                                if close_id:
-                                    self.db.set_trade_close_info(tr.order_id, close_id, tr.take_profit_price)
-                                self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
-                                # best-effort: cancel any remaining protective orders (TP/SL) after closing
+                            except Exception:
+                                close_id = None
+                            # try fetch avgPrice for accurate close
+                            close_price = last_price
+                            if close_id:
+                                row = self.order_manager.wait_for_filled(close_id, timeout_s=5.0)
                                 try:
-                                    symbol = symbol or symbols_by_id.get(tr.symbol_id, "")
-                                    if getattr(tr, "tp_order_id", None):
-                                        self.order_manager.cancel_order(symbol, str(tr.tp_order_id))
-                                    if getattr(tr, "sl_order_id", None):
-                                        self.order_manager.cancel_order(symbol, str(tr.sl_order_id))
+                                    if isinstance(row, dict):
+                                        cp = row.get("avgPrice") or row.get("price")
+                                        if cp is not None:
+                                            close_price = float(cp)
                                 except Exception:
                                     pass
-                            except Exception:
-                                pass
-                            # percent PnL relative to notional
-                            notional = tr.entry_price * tr.quantity
-                            pct = (pnl_net / notional * 100.0) if notional > 0 else 0.0
-                            msg = f"TP HIT: {symbol} pnl_net={pnl_net:.4f} ({pct:.2f}%)"
+                            self._close_position_with_pnl(tr, symbol, close_price, "TP HIT", close_id)
                             try:
-                                self.notifier.send_telegram(msg)
+                                self.software_sl.remove_sl_position(tr.order_id)
                             except Exception:
                                 pass
-                            self.logger.info(
-                                f"TP hit: symbol_id={tr.symbol_id} closed {tr.quantity} at {last_price} (TP {tr.take_profit_price}) net={pnl_net:.4f} ({pct:.2f}%)"
-                            )
                         else:
                             self.logger.error(f"TP close failed for {symbol} (order_id={tr.order_id}) - will retry")
                     continue
                 # Ensure BE SL exists for filled orders even if initial fill was slow (delayed placement)
-                try:
-                    if self.config.place_exchange_sl and not getattr(tr, "sl_order_id", None):
-                        row = self.order_manager.get_order_fill_row(str(tr.order_id))
-                        if row and str(row.get("orderStatus", "")).lower() == "filled":
-                            # update entry/qty if needed and place BE SL
-                            try:
-                                avg = float(row.get("avgPrice") or row.get("price") or tr.entry_price)
-                                qty = float(row.get("cumExecQty") or row.get("qty") or tr.quantity)
-                                self.db.update_trade_entry_qty(tr.order_id, avg, qty)
-                            except Exception:
-                                avg = tr.entry_price
-                                qty = tr.quantity
-                            r = float(self.config.fee_rate)
-                            be_price = avg * (1.0 + r) / max(1e-12, (1.0 - r))
-                            symbol = symbols_by_id.get(tr.symbol_id, "")
-                            if symbol:
-                                sl_resp = self.order_manager.place_sl_stop_limit(symbol, qty, be_price)
-                                try:
-                                    sl_id = str(sl_resp.get("orderId") or sl_resp.get("result", {}).get("orderId")) if sl_resp else None
-                                except Exception:
-                                    sl_id = None
-                                if sl_id:
-                                    self.db.set_trade_sl_order(tr.order_id, sl_id, be_price)
-                                    try:
-                                        self.notifier.send_telegram(f"BE SL PLACED (DELAYED): {symbol} trigger={be_price:.6f}")
-                                    except Exception:
-                                        pass
-                except Exception:
-                    pass
+                # Legacy exchange SL placement removed
 
                 # Emergency drawdown SL: if price falls >= configured threshold from entry, market exit
                 try:
@@ -822,6 +942,10 @@ class MarketMonitor:
                                         except Exception:
                                             pass
                                     self._close_position_with_pnl(tr, symbol, close_price, f"DRAWDOWN EXIT (drop={drop_pct:.2f}%)", close_id)
+                                    try:
+                                        self.software_sl.remove_sl_position(tr.order_id)
+                                    except Exception:
+                                        pass
                                 else:
                                     self.logger.error(f"Drawdown close failed for {symbol} (order_id={tr.order_id}) - will retry")
                             continue
@@ -835,56 +959,14 @@ class MarketMonitor:
                         if row and str(row.get("orderStatus", "")).lower() == "filled":
                             symbol = symbols_by_id.get(tr.symbol_id, "")
                             close_price = float(row.get("avgPrice") or row.get("price") or tr.take_profit_price)
-                            # net pnl with fees
+                            close_id = str(row.get("orderId")) if row.get("orderId") else None
+                            self._close_position_with_pnl(tr, symbol, close_price, "TP HIT (SYNC)", close_id)
                             try:
-                                fee_rate = float(self.config.fee_rate)
-                            except Exception:
-                                fee_rate = 0.001
-                            fee_entry = tr.entry_price * tr.quantity * fee_rate
-                            fee_exit = close_price * tr.quantity * fee_rate
-                            pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
-                            self.db.close_trade(tr.order_id, pnl_net)
-                            try:
-                                close_id = str(row.get("orderId"))
-                                if close_id:
-                                    self.db.set_trade_close_info(tr.order_id, close_id, close_price)
-                                self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
+                                self.software_sl.remove_sl_position(tr.order_id)
                             except Exception:
                                 pass
-                            msg = f"TP HIT (SYNC): {symbol} qty={tr.quantity} close={close_price:.6f} pnl_net={pnl_net:.4f}"
-                            try:
-                                self.notifier.send_telegram(msg)
-                            except Exception:
-                                pass
-                            self.logger.info(msg)
                             continue
-                    if getattr(tr, "sl_order_id", None):
-                        row = self.order_manager.get_order_fill_row(str(tr.sl_order_id))
-                        if row and str(row.get("orderStatus", "")).lower() == "filled":
-                            symbol = symbols_by_id.get(tr.symbol_id, "")
-                            close_price = float(row.get("avgPrice") or row.get("price") or (tr.sl_price or tr.entry_price))
-                            try:
-                                fee_rate = float(self.config.fee_rate)
-                            except Exception:
-                                fee_rate = 0.001
-                            fee_entry = tr.entry_price * tr.quantity * fee_rate
-                            fee_exit = close_price * tr.quantity * fee_rate
-                            pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
-                            self.db.close_trade(tr.order_id, pnl_net)
-                            try:
-                                close_id = str(row.get("orderId"))
-                                if close_id:
-                                    self.db.set_trade_close_info(tr.order_id, close_id, close_price)
-                                self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
-                            except Exception:
-                                pass
-                            msg = f"BREAKEVEN EXIT (SYNC): {symbol} qty={tr.quantity} close={close_price:.6f} pnl_net={pnl_net:.4f}"
-                            try:
-                                self.notifier.send_telegram(msg)
-                            except Exception:
-                                pass
-                            self.logger.info(msg)
-                            continue
+                    # Legacy SL order sync removed
                 except Exception as e:
                     self.logger.debug(f"Order history sync error: {e}")
         except Exception as e:

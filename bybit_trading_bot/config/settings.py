@@ -32,6 +32,7 @@ class Config:
     signal_window_minutes: int
     min_unique_oi_bars: int
     emergency_stop: bool
+    stop_sl: bool
 
     telegram_enabled: bool
     telegram_bot_token: Optional[str]
@@ -56,11 +57,23 @@ class Config:
     rsi_period: int
     rsi_oversold: float
     rsi_overbought: float
+    enable_rsi_filter: bool
+    trade_rsi_overbought: float
     macd_fast: int
     macd_slow: int
     macd_signal: int
+    enable_macd_filter: bool
+    trade_macd_require_above_signal: bool
+    trade_macd_require_above_zero: bool
+    trade_macd_min_bars: int
     volume_spike_multiplier: float
     volume_lookback_periods: int
+    # RVOL filter
+    enable_rvol_filter: bool
+    rvol_period: int
+    rvol_threshold: float
+    rvol_breakout_min: float
+    min_quote_volume_5m_usdt: float
     orderbook_imbalance_threshold: float
     bid_ask_spread_threshold: float
     split_max_open_orders: int
@@ -68,6 +81,16 @@ class Config:
     # Fees
     fee_rate: float
     drawdown_exit_threshold_pct: float
+    # Software SL params
+    software_sl_check_interval: float
+    software_sl_price_cache_ttl: float
+    software_sl_heartbeat_enabled: bool
+    software_sl_heartbeat_interval: float
+    software_sl_price_fail_threshold: int
+    software_sl_activation_delay_seconds: float
+    software_sl_hysteresis_pct: float
+    software_sl_max_retries: int
+    software_sl_retry_backoff_base: float
 
 
 def _get_bool(value: str | None, default: bool) -> bool:
@@ -105,6 +128,7 @@ def load_settings() -> Config:
     signal_window_minutes = int(os.getenv("SIGNAL_WINDOW_MINUTES", "5"))
     min_unique_oi_bars = int(os.getenv("MIN_UNIQUE_OI_BARS", "2"))
     emergency_stop = _get_bool(os.getenv("EMERGENCY_STOP"), False)
+    stop_sl = _get_bool(os.getenv("STOP_SL"), False)
 
     telegram_enabled = _get_bool(os.getenv("TELEGRAM_ENABLED"), False)
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -127,17 +151,42 @@ def load_settings() -> Config:
     rsi_period = int(os.getenv("RSI_PERIOD", "14"))
     rsi_oversold = float(os.getenv("RSI_OVERSOLD", "30"))
     rsi_overbought = float(os.getenv("RSI_OVERBOUGHT", "70"))
+    enable_rsi_filter = _get_bool(os.getenv("ENABLE_RSI_FILTER"), True)
+    trade_rsi_overbought = float(os.getenv("TRADE_RSI_OVERBOUGHT", "74"))
     macd_fast = int(os.getenv("MACD_FAST", "12"))
     macd_slow = int(os.getenv("MACD_SLOW", "26"))
     macd_signal = int(os.getenv("MACD_SIGNAL", "9"))
+    enable_macd_filter = _get_bool(os.getenv("ENABLE_MACD_FILTER"), True)
+    trade_macd_require_above_signal = _get_bool(os.getenv("TRADE_MACD_REQUIRE_ABOVE_SIGNAL"), True)
+    trade_macd_require_above_zero = _get_bool(os.getenv("TRADE_MACD_REQUIRE_ABOVE_ZERO"), True)
+    trade_macd_min_bars = int(os.getenv("TRADE_MACD_MIN_BARS", "2"))
     volume_spike_multiplier = float(os.getenv("VOLUME_SPIKE_MULTIPLIER", "2.5"))
     volume_lookback_periods = int(os.getenv("VOLUME_LOOKBACK_PERIODS", "20"))
+    # RVOL filter
+    enable_rvol_filter = _get_bool(os.getenv("ENABLE_RVOL_FILTER"), True)
+    rvol_period = int(os.getenv("RVOL_PERIOD", "20"))
+    rvol_threshold = float(os.getenv("RVOL_THRESHOLD", "1.8"))
+    rvol_breakout_min = float(os.getenv("RVOL_BREAKOUT_MIN", "1.2"))
+    min_quote_volume_5m_usdt = float(os.getenv("MIN_QUOTE_VOLUME_5M_USDT", "10000"))
     orderbook_imbalance_threshold = float(os.getenv("ORDERBOOK_IMBALANCE_THRESHOLD", "0.15"))
     bid_ask_spread_threshold = float(os.getenv("BID_ASK_SPREAD_THRESHOLD", "0.002"))
     split_max_open_orders = int(os.getenv("SPLIT_MAX_OPEN_ORDERS", "3"))
     split_trading_pairs = os.getenv("SPLIT_TRADING_PAIRS")
     fee_rate = float(os.getenv("FEE_RATE", "0.001"))
     drawdown_exit_threshold_pct = float(os.getenv("DRAWDOWN_EXIT_THRESHOLD_PCT", "10.0"))
+    # Software SL
+    software_sl_check_interval = float(os.getenv("SOFTWARE_SL_CHECK_INTERVAL", "1.0"))
+    software_sl_price_cache_ttl = float(os.getenv("SOFTWARE_SL_PRICE_CACHE_TTL", "5.0"))
+    software_sl_heartbeat_enabled = _get_bool(os.getenv("SOFTWARE_SL_HEARTBEAT_ENABLED"), True)
+    software_sl_heartbeat_interval = float(os.getenv("SOFTWARE_SL_HEARTBEAT_INTERVAL", "60.0"))
+    software_sl_price_fail_threshold = int(os.getenv("SOFTWARE_SL_PRICE_FAIL_THRESHOLD", "5"))
+    # Delay activation after ORDER FILLED (minutes -> seconds)
+    _sl_delay_min = float(os.getenv("SOFTWARE_SL_ACTIVATION_DELAY_MINUTES", "5.0"))
+    software_sl_activation_delay_seconds = max(0.0, _sl_delay_min * 60.0)
+    # Hysteresis and retries
+    software_sl_hysteresis_pct = float(os.getenv("SOFTWARE_SL_HYSTERESIS_PCT", "0.05"))
+    software_sl_max_retries = int(os.getenv("SOFTWARE_SL_MAX_RETRIES", "3"))
+    software_sl_retry_backoff_base = float(os.getenv("SOFTWARE_SL_RETRY_BACKOFF_BASE", "0.5"))
     if drawdown_exit_threshold_pct <= 0 or drawdown_exit_threshold_pct > 50:
         try:
             print(f"WARNING: Invalid DRAWDOWN_EXIT_THRESHOLD_PCT={drawdown_exit_threshold_pct}, using 10.0%")
@@ -165,6 +214,7 @@ def load_settings() -> Config:
         signal_window_minutes=signal_window_minutes,
         min_unique_oi_bars=min_unique_oi_bars,
         emergency_stop=emergency_stop,
+        stop_sl=stop_sl,
         telegram_enabled=telegram_enabled,
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id,
@@ -185,15 +235,35 @@ def load_settings() -> Config:
         rsi_period=rsi_period,
         rsi_oversold=rsi_oversold,
         rsi_overbought=rsi_overbought,
+        enable_rsi_filter=enable_rsi_filter,
+        trade_rsi_overbought=trade_rsi_overbought,
         macd_fast=macd_fast,
         macd_slow=macd_slow,
         macd_signal=macd_signal,
+        enable_macd_filter=enable_macd_filter,
+        trade_macd_require_above_signal=trade_macd_require_above_signal,
+        trade_macd_require_above_zero=trade_macd_require_above_zero,
+        trade_macd_min_bars=trade_macd_min_bars,
         volume_spike_multiplier=volume_spike_multiplier,
         volume_lookback_periods=volume_lookback_periods,
+        enable_rvol_filter=enable_rvol_filter,
+        rvol_period=rvol_period,
+        rvol_threshold=rvol_threshold,
+        rvol_breakout_min=rvol_breakout_min,
+        min_quote_volume_5m_usdt=min_quote_volume_5m_usdt,
         orderbook_imbalance_threshold=orderbook_imbalance_threshold,
         bid_ask_spread_threshold=bid_ask_spread_threshold,
         split_max_open_orders=split_max_open_orders,
         split_trading_pairs=split_trading_pairs,
         fee_rate=fee_rate,
         drawdown_exit_threshold_pct=drawdown_exit_threshold_pct,
+        software_sl_check_interval=software_sl_check_interval,
+        software_sl_price_cache_ttl=software_sl_price_cache_ttl,
+        software_sl_heartbeat_enabled=software_sl_heartbeat_enabled,
+        software_sl_heartbeat_interval=software_sl_heartbeat_interval,
+        software_sl_price_fail_threshold=software_sl_price_fail_threshold,
+        software_sl_activation_delay_seconds=software_sl_activation_delay_seconds,
+        software_sl_hysteresis_pct=software_sl_hysteresis_pct,
+        software_sl_max_retries=software_sl_max_retries,
+        software_sl_retry_backoff_base=software_sl_retry_backoff_base,
     ) 

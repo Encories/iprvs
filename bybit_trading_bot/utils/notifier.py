@@ -131,7 +131,7 @@ class TelegramCommandListener:
                             self._reply(chat_id, "Resume command accepted")
                         except Exception as e:
                             self.logger.error(f"on_start error: {e}")
-                    elif low in {"/rate", "rate"} and self._on_rate:
+                    elif low in {"/rateb", "rateb"} and self._on_rate:
                         try:
                             report = self._on_rate() or "No data"
                             self._reply(chat_id, report)
