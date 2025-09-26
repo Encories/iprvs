@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+import re
 from typing import Optional, Literal
 
 from dotenv import load_dotenv
@@ -81,6 +82,9 @@ class Config:
     # Fees
     fee_rate: float
     drawdown_exit_threshold_pct: float
+    # Panic sell on small drop
+    panic_sell_enabled: bool
+    panic_sell_drop_pct: float
     # Software SL params
     software_sl_check_interval: float
     software_sl_price_cache_ttl: float
@@ -97,6 +101,17 @@ def _get_bool(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _get_int_env(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        return int(v.strip())
+    except Exception:
+        m = re.search(r"-?\d+", v)
+        return int(m.group(0)) if m else default
 
 
 def load_settings() -> Config:
@@ -153,9 +168,9 @@ def load_settings() -> Config:
     rsi_overbought = float(os.getenv("RSI_OVERBOUGHT", "70"))
     enable_rsi_filter = _get_bool(os.getenv("ENABLE_RSI_FILTER"), True)
     trade_rsi_overbought = float(os.getenv("TRADE_RSI_OVERBOUGHT", "74"))
-    macd_fast = int(os.getenv("MACD_FAST", "12"))
-    macd_slow = int(os.getenv("MACD_SLOW", "26"))
-    macd_signal = int(os.getenv("MACD_SIGNAL", "9"))
+    macd_fast = _get_int_env("MACD_FAST", 12)
+    macd_slow = _get_int_env("MACD_SLOW", 26)
+    macd_signal = _get_int_env("MACD_SIGNAL", 9)
     enable_macd_filter = _get_bool(os.getenv("ENABLE_MACD_FILTER"), True)
     trade_macd_require_above_signal = _get_bool(os.getenv("TRADE_MACD_REQUIRE_ABOVE_SIGNAL"), True)
     trade_macd_require_above_zero = _get_bool(os.getenv("TRADE_MACD_REQUIRE_ABOVE_ZERO"), True)
@@ -174,6 +189,9 @@ def load_settings() -> Config:
     split_trading_pairs = os.getenv("SPLIT_TRADING_PAIRS")
     fee_rate = float(os.getenv("FEE_RATE", "0.001"))
     drawdown_exit_threshold_pct = float(os.getenv("DRAWDOWN_EXIT_THRESHOLD_PCT", "10.0"))
+    # Panic sell on small drop after entry
+    panic_sell_enabled = _get_bool(os.getenv("ENABLE_PANIC_SELL"), True)
+    panic_sell_drop_pct = float(os.getenv("PANIC_SELL_DROP_PCT", "2.0"))
     # Software SL
     software_sl_check_interval = float(os.getenv("SOFTWARE_SL_CHECK_INTERVAL", "1.0"))
     software_sl_price_cache_ttl = float(os.getenv("SOFTWARE_SL_PRICE_CACHE_TTL", "5.0"))
@@ -257,6 +275,8 @@ def load_settings() -> Config:
         split_trading_pairs=split_trading_pairs,
         fee_rate=fee_rate,
         drawdown_exit_threshold_pct=drawdown_exit_threshold_pct,
+        panic_sell_enabled=panic_sell_enabled,
+        panic_sell_drop_pct=panic_sell_drop_pct,
         software_sl_check_interval=software_sl_check_interval,
         software_sl_price_cache_ttl=software_sl_price_cache_ttl,
         software_sl_heartbeat_enabled=software_sl_heartbeat_enabled,

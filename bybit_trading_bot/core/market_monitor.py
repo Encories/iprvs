@@ -57,7 +57,7 @@ class MarketMonitor:
         self.symbol_mapper = SymbolMapper(self.config, self.db)
         self.order_manager = OrderManager(self.config, self.db)
         self.notifier = Notifier(self.config)
-        self.tg_listener = TelegramCommandListener(self.config, on_stop=self._activate_runtime_emergency, on_rate=self._build_rate_report, on_start=self._deactivate_runtime_emergency, on_signal=self._on_tg_signal)
+        self.tg_listener = TelegramCommandListener(self.config, on_stop=self._activate_runtime_emergency, on_rate=self._build_rate_report, on_start=self._deactivate_runtime_emergency, on_signal=self._on_tg_signal, on_orders=self._build_open_orders_report, on_panics=self._build_panic_sell_report)
         # Software SL manager
         self.software_sl = SoftwareSLManager(self.config, self.db, self.notifier)
         self.spot = SpotHandler(testnet=self.config.bybit_testnet)
@@ -104,6 +104,107 @@ class MarketMonitor:
         except Exception as e:
             self.logger.error(f"Build rate report error: {e}")
             return "Rate error"
+
+    def _build_open_orders_report(self) -> str:
+        """Fetch live open spot orders from Bybit and format a concise report."""
+        try:
+            from bybit_trading_bot.core.order_manager import OrderManager
+            om = self.order_manager
+            if om is None or getattr(om, "_http", None) is None:
+                return "Open orders: not available (HTTP client offline)"
+            # Fetch all open spot orders
+            try:
+                resp = om._http.request("get_open_orders", category="spot")
+                if int(resp.get("retCode", -1)) != 0:
+                    return f"Open orders fetch failed: {resp.get('retCode')} {resp.get('retMsg')}"
+                rows = (resp.get("result", {}) or {}).get("list", [])
+            except Exception as e:
+                return f"Open orders error: {e}"
+            if not rows:
+                return "No open spot orders"
+            # Build lines
+            out: List[str] = ["Open spot orders:"]
+            for r in rows[:50]:
+                try:
+                    sym = str(r.get("symbol") or "?")
+                    side = str(r.get("side") or "?")
+                    otype = str(r.get("orderType") or "?")
+                    qty = r.get("qty") or r.get("baseQty") or r.get("cumExecQty") or "?"
+                    price = r.get("price") or r.get("avgPrice") or "-"
+                    status = str(r.get("orderStatus") or "open")
+                    oid = str(r.get("orderId") or "")
+                    out.append(f"{sym} {side} {otype} qty={qty} price={price} status={status} id={oid}")
+                except Exception:
+                    continue
+            return "\n".join(out)
+        except Exception as e:
+            self.logger.error(f"Build open orders report error: {e}")
+            return "Open orders error"
+
+    def _build_panic_sell_report(self) -> str:
+        """Build a report of all active panic sell monitoring positions."""
+        try:
+            # Check if panic sell is enabled
+            panic_enabled = getattr(self.config, "panic_sell_enabled", False)
+            if not panic_enabled:
+                return "Panic sell monitoring is disabled"
+            
+            # Debug: Check all trades in DB first
+            try:
+                conn = self.db._get_conn()
+                cur = conn.cursor()
+                cur.execute("SELECT order_id, symbol_id, entry_price, status FROM trades ORDER BY created_at DESC LIMIT 10")
+                all_trades = cur.fetchall()
+                self.logger.info(f"PANIC REPORT: All trades in DB (last 10): {[(r['order_id'], r['symbol_id'], r['entry_price'], r['status']) for r in all_trades]}")
+            except Exception as e:
+                self.logger.error(f"PANIC REPORT: Error checking all trades: {e}")
+            
+            # Get all open trades
+            open_trades = self.db.get_open_trades()
+            self.logger.info(f"PANIC REPORT: Found {len(open_trades)} open trades in DB")
+            if not open_trades:
+                return "No open positions to monitor for panic sell"
+            
+            # Debug: log all open trades
+            for i, tr in enumerate(open_trades):
+                self.logger.info(f"PANIC REPORT: Trade {i+1}: order_id={tr.order_id} symbol_id={tr.symbol_id} entry_price={tr.entry_price} status={tr.status}")
+            
+            # Get symbol mapping
+            symbols_by_id = {rec.id: rec.spot_symbol for rec in self.db.get_active_symbols()}
+            self.logger.info(f"PANIC REPORT: Symbol mapping: {symbols_by_id}")
+            panic_threshold = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
+            
+            # Build report
+            lines = [f"Panic Sell Monitoring (threshold: {panic_threshold:.1f}%):"]
+            
+            for tr in open_trades:
+                if tr.entry_price <= 0:
+                    self.logger.debug(f"PANIC REPORT: Skipping trade {tr.order_id} - entry_price={tr.entry_price}")
+                    continue
+                    
+                symbol = symbols_by_id.get(tr.symbol_id, f"UNKNOWN_{tr.symbol_id}")
+                last_price = self.db.get_last_price(tr.symbol_id)
+                self.logger.debug(f"PANIC REPORT: Processing {symbol} entry={tr.entry_price} last={last_price}")
+                
+                if last_price is None:
+                    lines.append(f"  {symbol}: entry={tr.entry_price:.6f} last=NO_DATA")
+                    continue
+                
+                # Calculate current drop percentage
+                drop_pct = (last_price - tr.entry_price) / tr.entry_price * 100.0
+                trigger_price = tr.entry_price * (1.0 - panic_threshold / 100.0)
+                
+                # Status indicators
+                status = "🟢 SAFE" if drop_pct > -panic_threshold else "🔴 TRIGGERED"
+                if drop_pct <= -panic_threshold * 0.8:  # 80% of threshold
+                    status = "🟡 WARNING"
+                
+                lines.append(f"  {symbol}: entry={tr.entry_price:.6f} last={last_price:.6f} drop={drop_pct:.2f}% trigger={trigger_price:.6f} {status}")
+            
+            return "\n".join(lines)
+        except Exception as e:
+            self.logger.error(f"Build panic sell report error: {e}")
+            return "Panic sell report error"
 
     def _close_position_with_pnl(
         self,
@@ -240,16 +341,12 @@ class MarketMonitor:
             symbols = [rec.spot_symbol for rec in self.db.get_active_symbols()]
             if symbols:
                 self.spot.subscribe_tickers_with_callback(symbols, self._on_spot_ticker)
-                # Also subscribe to public trades to aggregate 1m volumes for RVOL
-                try:
-                    # Use direct ws handler to add trades subscription without orderbook if available
-                    from bybit_trading_bot.handlers.websocket_handler import WebSocketHandler as _WS
-                    if isinstance(self.spot.ws, _WS):
-                        self.spot.ws.subscribe_orderbook_and_trades(symbols, on_orderbook=None, on_trade=self._on_trade_tick)  # type: ignore[attr-defined]
-                except Exception:
-                    # Fallback to SpotHandler composite method
+                # RVOL uses public trades; disable for trade mode per request
+                if getattr(self.config, "enable_rvol_filter", False) and self.config.switch_mode != "trade":
                     try:
-                        self.spot.subscribe_tickers_with_callback(symbols, self._on_spot_ticker)
+                        from bybit_trading_bot.handlers.websocket_handler import WebSocketHandler as _WS
+                        if isinstance(self.spot.ws, _WS):
+                            self.spot.ws.subscribe_orderbook_and_trades(symbols, on_orderbook=None, on_trade=self._on_trade_tick)  # type: ignore[attr-defined]
                     except Exception:
                         pass
         except Exception as e:
@@ -379,8 +476,8 @@ class MarketMonitor:
             except Exception:
                 pass
 
-        # RVOL filter (trade mode): require liquidity; allow lower RVOL on breakout
-        if getattr(self.config, "enable_rvol_filter", False) and self.config.switch_mode == "trade":
+        # RVOL filter is disabled for trade mode per request
+        if getattr(self.config, "enable_rvol_filter", False) and self.config.switch_mode != "trade":
             try:
                 symbol = self.db._get_spot_symbol_by_id(symbol_id) or ""
                 if symbol:
@@ -465,6 +562,17 @@ class MarketMonitor:
             )
             if qty <= 0.0:
                 return
+            # API-level guard: skip if there are already open spot orders for this symbol
+            try:
+                if self.order_manager.has_open_spot_order(symbol):
+                    self.logger.warning(f"Skip placing order for {symbol}: open spot order exists (API)")
+                    try:
+                        self.notifier.send_telegram(f"SKIP: {symbol} has an existing open order (API)")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
             tp_price = last_price * (1.0 + self.config.take_profit_percent / 100.0)
             order = self.order_manager.place_spot_order(
                 symbol,
@@ -509,15 +617,18 @@ class MarketMonitor:
                     try:
                         tp_id = str(tp_resp.get("orderId") or tp_resp.get("result", {}).get("orderId") ) if tp_resp else None
                         self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, avg, tp_price, "open", stop_loss_price=None, tp_order_id=tp_id)
-                    except Exception:
+                        self.logger.info(f"TRADE SAVED TO DB: {symbol} order_id={order_id} entry={avg:.6f} qty={safe_qty} tp_id={tp_id}")
+                    except Exception as e:
                         tp_id = None
+                        self.logger.error(f"FAILED TO SAVE TRADE TO DB: {symbol} order_id={order_id} error={e}")
                     # update entry qty/fees
                     try:
                         self.db.update_trade_entry_qty(order_id, avg, safe_qty)
                         if fee_entry is not None:
                             self.db.update_trade_fees(order_id, fee_entry=fee_entry)
-                    except Exception:
-                        pass
+                        self.logger.info(f"TRADE UPDATED IN DB: {symbol} order_id={order_id} entry={avg:.6f} qty={safe_qty}")
+                    except Exception as e:
+                        self.logger.error(f"FAILED TO UPDATE TRADE IN DB: {symbol} order_id={order_id} error={e}")
                     # Добавить Software SL (если не отключен STOP_SL)
                     try:
                         if self.config.place_exchange_sl and not getattr(self.config, "stop_sl", False):
@@ -557,6 +668,17 @@ class MarketMonitor:
                     if expected_net is not None:
                         extra += f" expected_pnl_net={expected_net:.4f}"
                     self.notifier.send_telegram(f"ORDER FILLED: {symbol} qty={safe_qty} avg={avg:.6f}{extra}")
+                    # Announce panic-monitor parameters immediately after fill
+                    try:
+                        if getattr(self.config, "panic_sell_enabled", False):
+                            ps = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
+                            trigger = avg * (1.0 - abs(ps) / 100.0)
+                            self.notifier.send_telegram(
+                                f"PANIC MONITOR ENABLED: {symbol} entry={avg:.6f} drop={ps:.2f}% trigger={trigger:.6f} — market sell will execute even if TP is open"
+                            )
+                            self.logger.info(f"PANIC MONITOR ENABLED: {symbol} entry={avg:.6f} drop={ps:.2f}% trigger={trigger:.6f}")
+                    except Exception:
+                        pass
                     self.logger.info(f"ORDER FILLED: {symbol} qty={safe_qty} avg={avg}")
                     return
             avail_qty = self.order_manager.get_available_base_qty(symbol, max_wait_s=6.0)
@@ -569,6 +691,7 @@ class MarketMonitor:
             if not tp_resp:
                 self.notifier.send_telegram(f"TP PLACE FAILED: {symbol}")
             self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, last_price, tp_price, "open", stop_loss_price=None, tp_order_id=(tp_resp or {}).get("orderId") if tp_resp else None)
+            self.logger.info(f"TRADE SAVED TO DB (alt): {symbol} order_id={order_id} entry={last_price:.6f} qty={safe_qty}")
             self.db.insert_signal(symbol_id, price_change, oi_change, action_taken="bought")
             try:
                 # remaining open order slots
@@ -579,6 +702,17 @@ class MarketMonitor:
                 remaining = None
             extra = f" | slots_left={remaining}" if remaining is not None else ""
             self.notifier.send_telegram(f"ORDER PLACED: {symbol} qty={safe_qty} entry={last_price:.6f} tp={tp_price:.6f}{extra}")
+            # Announce panic-monitor parameters after placement when fill wasn't confirmed
+            try:
+                if getattr(self.config, "panic_sell_enabled", False):
+                    ps = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
+                    trigger = last_price * (1.0 - abs(ps) / 100.0)
+                    self.notifier.send_telegram(
+                        f"PANIC MONITOR ENABLED: {symbol} entry≈{last_price:.6f} drop={ps:.2f}% trigger≈{trigger:.6f} — market sell will execute even if TP is open"
+                    )
+                    self.logger.info(f"PANIC MONITOR ENABLED: {symbol} entry≈{last_price:.6f} drop={ps:.2f}% trigger≈{trigger:.6f}")
+            except Exception:
+                pass
             self.logger.info(f"✅ ORDER PLACED: {symbol} - Qty: {safe_qty}, TP: {tp_price}")
         except Exception as e:
             self.logger.error(f"Failed to execute trade signal for {symbol_id}: {e}")
@@ -917,6 +1051,62 @@ class MarketMonitor:
                 # Ensure BE SL exists for filled orders even if initial fill was slow (delayed placement)
                 # Legacy exchange SL placement removed
 
+                # Panic sell: fast exit on small drop from entry (e.g., 2%)
+                try:
+                    panic_enabled = getattr(self.config, "panic_sell_enabled", False)
+                    self.logger.debug(f"PANIC SELL CONFIG: enabled={panic_enabled}, entry_price={tr.entry_price}")
+                    if panic_enabled and tr.entry_price > 0:
+                        ps_thresh = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
+                        drop_pct_ps = (last_price - tr.entry_price) / tr.entry_price * 100.0
+                        # Debug logging
+                        symbol_name = symbols_by_id.get(tr.symbol_id, 'UNKNOWN')
+                        self.logger.debug(f"PANIC SELL CHECK: {symbol_name} entry={tr.entry_price:.6f} last={last_price:.6f} drop={drop_pct_ps:.2f}% threshold={ps_thresh:.2f}%")
+                        # Check if price dropped below threshold (negative drop percentage)
+                        if drop_pct_ps <= -abs(ps_thresh):
+                            self.logger.warning(f"PANIC SELL TRIGGERED: {symbol_name} drop={drop_pct_ps:.2f}% <= -{ps_thresh:.2f}%")
+                            symbol = symbols_by_id.get(tr.symbol_id, "")
+                            if symbol:
+                                # Notify immediately about panic sell trigger
+                                try:
+                                    self.notifier.send_telegram(
+                                        f"PANIC SELL TRIGGERED: {symbol} drop={drop_pct_ps:.2f}% entry={tr.entry_price:.6f} last={last_price:.6f}. Cancelling TP and selling at market."
+                                    )
+                                except Exception:
+                                    pass
+                                self.logger.warning(
+                                    f"PANIC SELL TRIGGERED for {symbol}: drop={drop_pct_ps:.2f}% entry={tr.entry_price:.6f} last={last_price:.6f}"
+                                )
+                                resp = self.order_manager.close_position_market(symbol, tr.quantity)
+                                if resp:
+                                    try:
+                                        close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
+                                    except Exception:
+                                        close_id = None
+                                    close_price = last_price
+                                    if close_id:
+                                        row = self.order_manager.wait_for_filled(close_id, timeout_s=5.0)
+                                        try:
+                                            if isinstance(row, dict):
+                                                cp = row.get("avgPrice") or row.get("price")
+                                                if cp is not None:
+                                                    close_price = float(cp)
+                                        except Exception:
+                                            pass
+                                    self._close_position_with_pnl(tr, symbol, close_price, f"PANIC SELL (drop={drop_pct_ps:.2f}%)", close_id)
+                                    try:
+                                        self.software_sl.remove_sl_position(tr.order_id)
+                                    except Exception:
+                                        pass
+                                else:
+                                    self.logger.error(f"Panic sell failed for {symbol} (order_id={tr.order_id}) - will retry")
+                                    try:
+                                        self.notifier.send_telegram(f"PANIC SELL FAILED: {symbol} could not close position immediately. Will retry.")
+                                    except Exception:
+                                        pass
+                            continue
+                except Exception as e:
+                    self.logger.debug(f"Panic sell error: {e}")
+
                 # Emergency drawdown SL: if price falls >= configured threshold from entry, market exit
                 try:
                     threshold_pct = float(self.config.drawdown_exit_threshold_pct)
@@ -974,8 +1164,13 @@ class MarketMonitor:
 
     def _run_executor(self) -> None:
         self.logger.info("Executor worker started")
+        last_panic_check = 0.0
+        panic_check_interval = 10.0  # Check panic sell every 10 seconds
+        
         while not self._stop_event.is_set():
             try:
+                current_time = time.time()
+                
                 if self._is_emergency():
                     with self._signals_lock:
                         self._pending_signals.clear()
@@ -986,26 +1181,38 @@ class MarketMonitor:
                         self._last_sync_time = now
                     time.sleep(1.0)
                     continue
+                    
                 if self.config.switch_mode == "tg":
                     # In tg mode ignore Bybit signals, but still monitor TP/SL
-                    self._monitor_take_profit_once()
+                    # Check panic sell every 10 seconds
+                    if current_time - last_panic_check >= panic_check_interval:
+                        self._monitor_take_profit_once()
+                        last_panic_check = current_time
                     time.sleep(1.0)
                     continue
+                    
                 signal_obj: Signal | None = None
                 with self._signals_lock:
                     if self._pending_signals:
                         signal_obj = self._pending_signals.pop(0)
+                        
                 if signal_obj:
                     self.execute_trade_signal(
                         symbol_id=signal_obj.symbol_id,
                         price_change=signal_obj.price_change_percent,
                         oi_change=signal_obj.oi_change_percent,
                     )
-                self._monitor_take_profit_once()
+                
+                # Check panic sell every 10 seconds
+                if current_time - last_panic_check >= panic_check_interval:
+                    self._monitor_take_profit_once()
+                    last_panic_check = current_time
+                    
                 now = time.time()
                 if now - self._last_sync_time >= 20.0:
                     self.order_manager.sync_cancellations()
                     self._last_sync_time = now
+                    
                 # Periodically check loss streak
                 self._check_loss_streak_and_stop()
             except Exception as e:
@@ -1044,6 +1251,17 @@ class MarketMonitor:
             if qty <= 0.0:
                 self.logger.warning(f"Calculated qty is zero for {spot_symbol}")
                 return
+            # API guard: don't place if an open order already exists
+            try:
+                if self.order_manager.has_open_spot_order(spot_symbol):
+                    self.logger.warning(f"TG: Skip placing order for {spot_symbol}: open order exists (API)")
+                    try:
+                        self.notifier.send_telegram(f"TG SKIP: {spot_symbol} has an existing open order (API)")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
             tp_price = last_price * (1.0 + self.config.take_profit_percent / 100.0)
             order = self.order_manager.place_spot_order(spot_symbol, "Buy", qty, tp_price, reference_price=last_price)
             if not order:

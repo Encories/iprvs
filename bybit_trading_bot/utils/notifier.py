@@ -37,7 +37,7 @@ class Notifier:
 
 
 class TelegramCommandListener:
-    def __init__(self, config: Config, on_stop: Callable[[], None], on_rate: Optional[Callable[[], str]] = None, on_start: Optional[Callable[[], None]] = None, on_signal: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, config: Config, on_stop: Callable[[], None], on_rate: Optional[Callable[[], str]] = None, on_start: Optional[Callable[[], None]] = None, on_signal: Optional[Callable[[str], None]] = None, on_orders: Optional[Callable[[], str]] = None, on_panics: Optional[Callable[[], str]] = None) -> None:
         self.config = config
         self.logger = get_logger(self.__class__.__name__)
         self._stop_event = threading.Event()
@@ -47,6 +47,8 @@ class TelegramCommandListener:
         self._on_rate = on_rate
         self._on_start = on_start
         self._on_signal = on_signal
+        self._on_orders = on_orders
+        self._on_panics = on_panics
 
     def start(self) -> None:
         if not (self.config.telegram_enabled and self.config.telegram_commands_enabled):
@@ -137,6 +139,18 @@ class TelegramCommandListener:
                             self._reply(chat_id, report)
                         except Exception as e:
                             self.logger.error(f"on_rate error: {e}")
+                    elif low in {"/orders", "orders"} and self._on_orders:
+                        try:
+                            report = self._on_orders() or "No open orders"
+                            self._reply(chat_id, report)
+                        except Exception as e:
+                            self.logger.error(f"on_orders error: {e}")
+                    elif low in {"/panics", "panics"} and self._on_panics:
+                        try:
+                            report = self._on_panics() or "No panic sell monitoring active"
+                            self._reply(chat_id, report)
+                        except Exception as e:
+                            self.logger.error(f"on_panics error: {e}")
                     elif self._on_signal and "|" in text and "open interest" in low:
                         # Raw forward from PumpScreener-like text
                         try:

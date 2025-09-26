@@ -458,6 +458,19 @@ class OrderManager:
         """Placeholder to avoid runtime errors; can be extended to sync fills in batch."""
         return
 
+    def has_open_spot_order(self, symbol: str) -> bool:
+        """Check via API if there are any open spot orders for the given symbol."""
+        if self._http is None:
+            return False
+        try:
+            resp = self._http.request("get_open_orders", category="spot", symbol=symbol)
+            if not isinstance(resp, dict) or int(resp.get("retCode", -1)) != 0:
+                return False
+            rows = (resp.get("result", {}) or {}).get("list", [])
+            return bool(rows)
+        except Exception:
+            return False
+
     def post_fill_tp_sl(self, symbol: str, filled_row: Dict, tp_pct: float, sl_pct: float) -> None:
         """After a buy fill, place TP limit (+pct). Exchange SL placement removed."""
         try:
