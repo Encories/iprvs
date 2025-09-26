@@ -71,6 +71,8 @@ class MarketMonitor:
         self._signals_lock = threading.Lock()
         self._last_sync_time: float = 0.0
         self._last_analyzer_summary: float = 0.0
+        self._last_api_sync_time: float = 0.0
+        self._last_panic_check_time: float = 0.0
         self._runtime_emergency_stop: bool = False
         self._loss_notify_sent: bool = False
         # In-memory 1m quote-volume buckets per symbol (epoch minute -> USDT volume)
@@ -142,69 +144,276 @@ class MarketMonitor:
             return "Open orders error"
 
     def _build_panic_sell_report(self) -> str:
-        """Build a report of all active panic sell monitoring positions."""
+        """Build a report of all active panic sell monitoring positions based on API data."""
         try:
             # Check if panic sell is enabled
             panic_enabled = getattr(self.config, "panic_sell_enabled", False)
             if not panic_enabled:
                 return "Panic sell monitoring is disabled"
             
-            # Debug: Check all trades in DB first
+            # Get all open spot orders from API
+            if not self.order_manager or not hasattr(self.order_manager, '_http') or not self.order_manager._http:
+                return "Panic sell monitoring: API client not available"
+            
             try:
-                conn = self.db._get_conn()
-                cur = conn.cursor()
-                cur.execute("SELECT order_id, symbol_id, entry_price, status FROM trades ORDER BY created_at DESC LIMIT 10")
-                all_trades = cur.fetchall()
-                self.logger.info(f"PANIC REPORT: All trades in DB (last 10): {[(r['order_id'], r['symbol_id'], r['entry_price'], r['status']) for r in all_trades]}")
+                resp = self.order_manager._http.request("get_open_orders", category="spot")
+                if int(resp.get("retCode", -1)) != 0:
+                    return f"Panic sell monitoring: API error {resp.get('retCode')} {resp.get('retMsg')}"
+                
+                open_orders = (resp.get("result", {}) or {}).get("list", [])
+                if not open_orders:
+                    return "No open spot orders found for panic sell monitoring"
+                
+                # Filter only buy orders (our positions)
+                buy_orders = [o for o in open_orders if str(o.get("side", "")).upper() == "BUY"]
+                if not buy_orders:
+                    return "No open buy orders found for panic sell monitoring"
+                
+                panic_threshold = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
+                lines = [f"Panic Sell Monitoring (threshold: {panic_threshold:.1f}%):"]
+                
+                for order in buy_orders:
+                    try:
+                        symbol = str(order.get("symbol", "UNKNOWN"))
+                        order_id = str(order.get("orderId", ""))
+                        qty = float(order.get("qty", 0))
+                        price = float(order.get("price", 0))
+                        avg_price = float(order.get("avgPrice", 0))
+                        status = str(order.get("orderStatus", ""))
+                        
+                        # Use average price if available, otherwise use order price
+                        entry_price = avg_price if avg_price > 0 else price
+                        if entry_price <= 0:
+                            continue
+                        
+                        # Get current market price
+                        symbol_id = self.db.get_symbol_id(symbol)
+                        last_price = self.db.get_last_price(symbol_id) if symbol_id else None
+                        
+                        if last_price is None:
+                            lines.append(f"  {symbol}: entry={entry_price:.6f} last=NO_DATA order_id={order_id}")
+                            continue
+                        
+                        # Calculate current drop percentage
+                        drop_pct = (last_price - entry_price) / entry_price * 100.0
+                        trigger_price = entry_price * (1.0 - panic_threshold / 100.0)
+                        
+                        # Status indicators
+                        if drop_pct > -panic_threshold:
+                            status_icon = "🟢 SAFE"
+                        elif drop_pct <= -panic_threshold * 0.8:  # 80% of threshold
+                            status_icon = "🟡 WARNING"
+                        else:
+                            status_icon = "🔴 TRIGGERED"
+                        
+                        lines.append(f"  {symbol}: entry={entry_price:.6f} last={last_price:.6f} drop={drop_pct:.2f}% trigger={trigger_price:.6f} {status_icon}")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing order {order.get('orderId', 'unknown')}: {e}")
+                        continue
+                
+                return "\n".join(lines)
+                
             except Exception as e:
-                self.logger.error(f"PANIC REPORT: Error checking all trades: {e}")
-            
-            # Get all open trades
-            open_trades = self.db.get_open_trades()
-            self.logger.info(f"PANIC REPORT: Found {len(open_trades)} open trades in DB")
-            if not open_trades:
-                return "No open positions to monitor for panic sell"
-            
-            # Debug: log all open trades
-            for i, tr in enumerate(open_trades):
-                self.logger.info(f"PANIC REPORT: Trade {i+1}: order_id={tr.order_id} symbol_id={tr.symbol_id} entry_price={tr.entry_price} status={tr.status}")
-            
-            # Get symbol mapping
-            symbols_by_id = {rec.id: rec.spot_symbol for rec in self.db.get_active_symbols()}
-            self.logger.info(f"PANIC REPORT: Symbol mapping: {symbols_by_id}")
-            panic_threshold = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
-            
-            # Build report
-            lines = [f"Panic Sell Monitoring (threshold: {panic_threshold:.1f}%):"]
-            
-            for tr in open_trades:
-                if tr.entry_price <= 0:
-                    self.logger.debug(f"PANIC REPORT: Skipping trade {tr.order_id} - entry_price={tr.entry_price}")
-                    continue
-                    
-                symbol = symbols_by_id.get(tr.symbol_id, f"UNKNOWN_{tr.symbol_id}")
-                last_price = self.db.get_last_price(tr.symbol_id)
-                self.logger.debug(f"PANIC REPORT: Processing {symbol} entry={tr.entry_price} last={last_price}")
+                self.logger.error(f"API error in panic sell report: {e}")
+                return f"Panic sell monitoring: API error - {e}"
                 
-                if last_price is None:
-                    lines.append(f"  {symbol}: entry={tr.entry_price:.6f} last=NO_DATA")
-                    continue
-                
-                # Calculate current drop percentage
-                drop_pct = (last_price - tr.entry_price) / tr.entry_price * 100.0
-                trigger_price = tr.entry_price * (1.0 - panic_threshold / 100.0)
-                
-                # Status indicators
-                status = "🟢 SAFE" if drop_pct > -panic_threshold else "🔴 TRIGGERED"
-                if drop_pct <= -panic_threshold * 0.8:  # 80% of threshold
-                    status = "🟡 WARNING"
-                
-                lines.append(f"  {symbol}: entry={tr.entry_price:.6f} last={last_price:.6f} drop={drop_pct:.2f}% trigger={trigger_price:.6f} {status}")
-            
-            return "\n".join(lines)
         except Exception as e:
             self.logger.error(f"Build panic sell report error: {e}")
             return "Panic sell report error"
+
+    def _monitor_panic_sell_from_api(self) -> None:
+        """Monitor panic sell conditions based on API data from open orders."""
+        try:
+            # Check if panic sell is enabled
+            panic_enabled = getattr(self.config, "panic_sell_enabled", False)
+            if not panic_enabled:
+                return
+            
+            # Get all open spot orders from API
+            if not self.order_manager or not hasattr(self.order_manager, '_http') or not self.order_manager._http:
+                return
+            
+            try:
+                resp = self.order_manager._http.request("get_open_orders", category="spot")
+                if int(resp.get("retCode", -1)) != 0:
+                    return
+                
+                open_orders = (resp.get("result", {}) or {}).get("list", [])
+                if not open_orders:
+                    return
+                
+                # Filter only buy orders (our positions)
+                buy_orders = [o for o in open_orders if str(o.get("side", "")).upper() == "BUY"]
+                if not buy_orders:
+                    return
+                
+                panic_threshold = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
+                
+                for order in buy_orders:
+                    try:
+                        symbol = str(order.get("symbol", "UNKNOWN"))
+                        order_id = str(order.get("orderId", ""))
+                        qty = float(order.get("qty", 0))
+                        price = float(order.get("price", 0))
+                        avg_price = float(order.get("avgPrice", 0))
+                        
+                        # Use average price if available, otherwise use order price
+                        entry_price = avg_price if avg_price > 0 else price
+                        if entry_price <= 0:
+                            continue
+                        
+                        # Get current market price
+                        symbol_id = self.db.get_symbol_id(symbol)
+                        last_price = self.db.get_last_price(symbol_id) if symbol_id else None
+                        
+                        if last_price is None:
+                            continue
+                        
+                        # Calculate current drop percentage
+                        drop_pct = (last_price - entry_price) / entry_price * 100.0
+                        
+                        # Check if panic sell should trigger
+                        if drop_pct <= -panic_threshold:
+                            self.logger.warning(f"PANIC SELL TRIGGERED (API): {symbol} drop={drop_pct:.2f}% entry={entry_price:.6f} last={last_price:.6f}")
+                            
+                            # Notify immediately
+                            try:
+                                self.notifier.send_telegram(
+                                    f"🚨 PANIC SELL TRIGGERED (API): {symbol} drop={drop_pct:.2f}% entry={entry_price:.6f} last={last_price:.6f}. Cancelling orders and selling at market."
+                                )
+                            except Exception:
+                                pass
+                            
+                            # Cancel all orders for this symbol and sell at market
+                            try:
+                                # Cancel all open orders for this symbol
+                                if self.order_manager._http:
+                                    resp_open = self.order_manager._http.request("get_open_orders", category="spot", symbol=symbol)
+                                    if int(resp_open.get("retCode", -1)) == 0:
+                                        rows = (resp_open.get("result", {}) or {}).get("list", [])
+                                        if rows:
+                                            self.logger.info(f"PANIC SELL: Found {len(rows)} open orders for {symbol}, cancelling all")
+                                            
+                                            # Cancel all orders
+                                            for order in rows:
+                                                order_id = str(order.get("orderId", ""))
+                                                if order_id:
+                                                    try:
+                                                        self.order_manager.cancel_order(symbol, order_id)
+                                                        self.logger.debug(f"PANIC SELL: Cancelled order {order_id} for {symbol}")
+                                                    except Exception as e:
+                                                        self.logger.warning(f"PANIC SELL: Failed to cancel order {order_id} for {symbol}: {e}")
+                                            
+                                            # Wait for cancellations to take effect
+                                            deadline = time.time() + 3.0
+                                            while time.time() < deadline:
+                                                try:
+                                                    resp_check = self.order_manager._http.request("get_open_orders", category="spot", symbol=symbol)
+                                                    if int(resp_check.get("retCode", -1)) == 0:
+                                                        remaining = (resp_check.get("result", {}) or {}).get("list", [])
+                                                        if not remaining:
+                                                            self.logger.info(f"PANIC SELL: All orders cancelled for {symbol}")
+                                                            break
+                                                    time.sleep(0.2)
+                                                except Exception:
+                                                    pass
+                                            
+                                            # Wait for balance refresh
+                                            time.sleep(1.0)
+                                
+                                # Get available balance and sell at market
+                                available_qty = self.order_manager.get_available_base_qty(symbol, max_wait_s=3.0)
+                                if available_qty > 0:
+                                    sell_resp = self.order_manager.close_position_market(symbol, available_qty)
+                                    if sell_resp:
+                                        try:
+                                            close_id = str(sell_resp.get("orderId") or sell_resp.get("result", {}).get("orderId")) if isinstance(sell_resp, dict) else None
+                                        except Exception:
+                                            close_id = None
+                                        
+                                        close_price = last_price
+                                        if close_id:
+                                            row = self.order_manager.wait_for_filled(close_id, timeout_s=5.0)
+                                            try:
+                                                if isinstance(row, dict):
+                                                    cp = row.get("avgPrice") or row.get("price")
+                                                    if cp is not None:
+                                                        close_price = float(cp)
+                                            except Exception:
+                                                pass
+                                        
+                                        # Update or create trade record in DB
+                                        try:
+                                            # Try to find existing trade record
+                                            existing_trade = None
+                                            try:
+                                                conn = self.db._get_conn()
+                                                cur = conn.cursor()
+                                                cur.execute("SELECT * FROM trades WHERE order_id = ? LIMIT 1", (order_id,))
+                                                row = cur.fetchone()
+                                                if row:
+                                                    existing_trade = row
+                                            except Exception:
+                                                pass
+                                            
+                                            if existing_trade:
+                                                # Update existing trade
+                                                self.db.set_trade_close_info(order_id, close_id, close_price)
+                                                pnl = (close_price - entry_price) * available_qty
+                                                self.db.close_trade(order_id, pnl)
+                                            else:
+                                                # Create new trade record
+                                                self.db.insert_trade(
+                                                    symbol_id=symbol_id,
+                                                    order_id=order_id,
+                                                    side="Buy",
+                                                    quantity=available_qty,
+                                                    entry_price=entry_price,
+                                                    take_profit_price=0.0,
+                                                    status="closed",
+                                                    close_order_id=close_id,
+                                                    close_price=close_price
+                                                )
+                                            
+                                            self.logger.info(f"PANIC SELL COMPLETED: {symbol} qty={available_qty} entry={entry_price:.6f} close={close_price:.6f}")
+                                            
+                                        except Exception as e:
+                                            self.logger.error(f"Error updating trade record for panic sell: {e}")
+                                        
+                                        try:
+                                            self.notifier.send_telegram(f"✅ PANIC SELL COMPLETED: {symbol} qty={available_qty} entry={entry_price:.6f} close={close_price:.6f}")
+                                        except Exception:
+                                            pass
+                                    else:
+                                        self.logger.error(f"PANIC SELL FAILED: {symbol} - could not place market sell order")
+                                        try:
+                                            self.notifier.send_telegram(f"❌ PANIC SELL FAILED: {symbol} - could not place market sell order")
+                                        except Exception:
+                                            pass
+                                else:
+                                    self.logger.error(f"PANIC SELL FAILED: {symbol} - no available balance")
+                                    try:
+                                        self.notifier.send_telegram(f"❌ PANIC SELL FAILED: {symbol} - no available balance")
+                                    except Exception:
+                                        pass
+                                        
+                            except Exception as e:
+                                self.logger.error(f"Error executing panic sell for {symbol}: {e}")
+                                try:
+                                    self.notifier.send_telegram(f"❌ PANIC SELL ERROR: {symbol} - {e}")
+                                except Exception:
+                                    pass
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing order {order.get('orderId', 'unknown')} for panic sell: {e}")
+                        continue
+                        
+            except Exception as e:
+                self.logger.error(f"API error in panic sell monitoring: {e}")
+                
+        except Exception as e:
+            self.logger.error(f"Panic sell monitoring error: {e}")
 
     def _close_position_with_pnl(
         self,
@@ -375,6 +584,7 @@ class MarketMonitor:
             threading.Thread(target=self._run_oi_poll, name="OIPoll", daemon=True),
             threading.Thread(target=self._run_analyzer, name="Analyzer", daemon=True),
             threading.Thread(target=self._run_executor, name="Executor", daemon=True),
+            threading.Thread(target=self._run_api_sync, name="APISync", daemon=True),
         ]
 
         for t in self._threads:
@@ -1177,6 +1387,7 @@ class MarketMonitor:
                     self._monitor_take_profit_once()
                     now = time.time()
                     if now - self._last_sync_time >= 20.0:
+                        self.logger.debug(f"SYNC: Starting sync_cancellations (emergency) at {now}")
                         self.order_manager.sync_cancellations()
                         self._last_sync_time = now
                     time.sleep(1.0)
@@ -1187,6 +1398,7 @@ class MarketMonitor:
                     # Check panic sell every 10 seconds
                     if current_time - last_panic_check >= panic_check_interval:
                         self._monitor_take_profit_once()
+                        self._monitor_panic_sell_from_api()
                         last_panic_check = current_time
                     time.sleep(1.0)
                     continue
@@ -1206,10 +1418,12 @@ class MarketMonitor:
                 # Check panic sell every 10 seconds
                 if current_time - last_panic_check >= panic_check_interval:
                     self._monitor_take_profit_once()
+                    self._monitor_panic_sell_from_api()
                     last_panic_check = current_time
                     
                 now = time.time()
                 if now - self._last_sync_time >= 20.0:
+                    self.logger.debug(f"SYNC: Starting sync_cancellations at {now}")
                     self.order_manager.sync_cancellations()
                     self._last_sync_time = now
                     
@@ -1219,6 +1433,232 @@ class MarketMonitor:
                 self.logger.error(f"Executor error: {e}")
             time.sleep(1.0)
         self.logger.info("Executor worker stopped")
+
+    def _run_api_sync(self) -> None:
+        """API synchronization worker - syncs all orders every 10 seconds."""
+        self.logger.info("API Sync worker started")
+        
+        # Initial sync immediately after startup
+        try:
+            self._sync_all_orders_from_api()
+            # Check for panic monitoring after initial sync
+            self._check_and_start_panic_monitoring()
+        except Exception as e:
+            self.logger.error(f"Initial API sync failed: {e}")
+        
+        while not self._stop_event.is_set():
+            try:
+                current_time = time.time()
+                
+                # Sync every 10 seconds
+                if current_time - self._last_api_sync_time >= 10.0:
+                    self._sync_all_orders_from_api()
+                    self._last_api_sync_time = current_time
+                
+                time.sleep(1.0)
+            except Exception as e:
+                self.logger.error(f"API sync worker error: {e}")
+                time.sleep(5.0)  # Wait longer on error
+        
+        self.logger.info("API Sync worker stopped")
+
+    def _sync_all_orders_from_api(self) -> None:
+        """Sync all orders from API to database."""
+        try:
+            if not self.order_manager or not hasattr(self.order_manager, '_http') or not self.order_manager._http:
+                return
+            
+            # Get all open spot orders from API
+            resp = self.order_manager._http.request("get_open_orders", category="spot")
+            if int(resp.get("retCode", -1)) != 0:
+                self.logger.warning(f"API sync failed: {resp.get('retCode')} {resp.get('retMsg')}")
+                return
+            
+            open_orders = (resp.get("result", {}) or {}).get("list", [])
+            self.logger.debug(f"API SYNC: Found {len(open_orders)} open orders on exchange")
+            
+            # Get all trades from database
+            all_trades = []
+            try:
+                conn = self.db._get_conn()
+                cur = conn.cursor()
+                cur.execute("SELECT order_id, symbol_id, status FROM trades ORDER BY created_at DESC")
+                all_trades = cur.fetchall()
+            except Exception as e:
+                self.logger.error(f"API SYNC: Failed to get trades from DB: {e}")
+                return
+            
+            # Create sets for comparison
+            api_order_ids = {str(o.get("orderId", "")) for o in open_orders if o.get("orderId")}
+            db_order_ids = {str(t["order_id"]) for t in all_trades}
+            
+            # Find orders that exist in DB but not in API (should be marked as cancelled/filled)
+            missing_in_api = db_order_ids - api_order_ids
+            
+            # Find orders that exist in API but not in DB (should be added to DB)
+            missing_in_db = api_order_ids - db_order_ids
+            
+            # Update status for orders missing in API
+            for order_id in missing_in_api:
+                try:
+                    # Check if it's an open trade
+                    conn = self.db._get_conn()
+                    cur = conn.cursor()
+                    cur.execute("SELECT status, side FROM trades WHERE order_id = ?", (order_id,))
+                    row = cur.fetchone()
+                    if row and row["status"] == "open":
+                        # Don't mark buy orders as cancelled - they might be filled
+                        # Only mark sell orders (TP/SL) as cancelled
+                        if row["side"] and row["side"].upper() == "BUY":
+                            self.logger.debug(f"API SYNC: Buy order {order_id} not found in API - likely filled, keeping status")
+                        else:
+                            self.logger.info(f"API SYNC: Marking sell order {order_id} as cancelled (not found in API)")
+                            self.db.set_trade_status(order_id, "cancelled")
+                except Exception as e:
+                    self.logger.error(f"API SYNC: Failed to update status for {order_id}: {e}")
+            
+            # Add new orders from API to DB
+            for order in open_orders:
+                order_id = str(order.get("orderId", ""))
+                if order_id in missing_in_db:
+                    try:
+                        symbol = str(order.get("symbol", ""))
+                        side = str(order.get("side", ""))
+                        qty = float(order.get("qty", 0))
+                        price = float(order.get("price", 0))
+                        avg_price = float(order.get("avgPrice", 0))
+                        status = str(order.get("orderStatus", ""))
+                        
+                        # Get symbol_id
+                        symbol_id = self.db.get_symbol_id(symbol)
+                        if symbol_id is None:
+                            self.logger.warning(f"API SYNC: Unknown symbol {symbol}, skipping order {order_id}")
+                            continue
+                        
+                        # For sell orders (TP/SL), try to link to existing buy order
+                        if side.upper() == "SELL":
+                            # Look for existing buy order for this symbol
+                            conn = self.db._get_conn()
+                            cur = conn.cursor()
+                            cur.execute(
+                                "SELECT order_id, entry_price, quantity FROM trades WHERE symbol_id = ? AND side = 'Buy' AND status = 'open' ORDER BY created_at DESC LIMIT 1",
+                                (symbol_id,)
+                            )
+                            buy_row = cur.fetchone()
+                            
+                            if buy_row:
+                                # Link this sell order to the buy order
+                                buy_order_id = buy_row["order_id"]
+                                buy_entry_price = buy_row["entry_price"]
+                                
+                                # Update the buy order with TP order ID
+                                cur.execute(
+                                    "UPDATE trades SET tp_order_id = ? WHERE order_id = ?",
+                                    (order_id, buy_order_id)
+                                )
+                                conn.commit()
+                                
+                                self.logger.info(f"API SYNC: Linked TP order {order_id} to buy order {buy_order_id} for {symbol}")
+                                continue  # Don't create separate trade record for TP
+                        
+                        # Use average price if available, otherwise use order price
+                        entry_price = avg_price if avg_price > 0 else price
+                        
+                        # Insert new trade record (for buy orders or unlinked sell orders)
+                        self.db.insert_trade(
+                            symbol_id=symbol_id,
+                            order_id=order_id,
+                            side=side,
+                            quantity=qty,
+                            entry_price=entry_price,
+                            take_profit_price=0.0,  # Will be updated when TP is placed
+                            status="open"
+                        )
+                        
+                        self.logger.info(f"API SYNC: Added new order {order_id} for {symbol} to DB")
+                        
+                    except Exception as e:
+                        self.logger.error(f"API SYNC: Failed to add order {order_id} to DB: {e}")
+            
+            # Update existing orders with current data from API
+            for order in open_orders:
+                order_id = str(order.get("orderId", ""))
+                if order_id in db_order_ids:
+                    try:
+                        # Update order data if needed
+                        avg_price = float(order.get("avgPrice", 0))
+                        qty = float(order.get("qty", 0))
+                        status = str(order.get("orderStatus", ""))
+                        
+                        if avg_price > 0:
+                            # Update entry price if we have average price
+                            conn = self.db._get_conn()
+                            cur = conn.cursor()
+                            cur.execute(
+                                "UPDATE trades SET entry_price = ?, quantity = ? WHERE order_id = ?",
+                                (avg_price, qty, order_id)
+                            )
+                            conn.commit()
+                            
+                    except Exception as e:
+                        self.logger.error(f"API SYNC: Failed to update order {order_id}: {e}")
+            
+            self.logger.debug(f"API SYNC: Completed - {len(missing_in_api)} marked as cancelled, {len(missing_in_db)} added to DB")
+            
+            # Check if we have open orders and need to start panic monitoring
+            self._check_and_start_panic_monitoring()
+            
+        except Exception as e:
+            self.logger.error(f"API sync error: {e}")
+
+    def _check_and_start_panic_monitoring(self) -> None:
+        """Check if we have open orders and start panic monitoring if needed."""
+        try:
+            # Check if panic sell is enabled
+            panic_enabled = getattr(self.config, "panic_sell_enabled", False)
+            if not panic_enabled:
+                return
+            
+            # Get count of open orders
+            open_trades = self.db.get_open_trades()
+            open_count = len(open_trades)
+            
+            if open_count > 0:
+                current_time = time.time()
+                
+                # Check if we need to start panic monitoring (every 30 seconds or first time)
+                if current_time - self._last_panic_check_time >= 30.0:
+                    self.logger.info(f"PANIC MONITOR: Found {open_count} open orders, starting panic monitoring")
+                    
+                    # Start panic monitoring for all open orders
+                    for tr in open_trades:
+                        try:
+                            symbol = self.db._get_spot_symbol_by_id(tr.symbol_id)
+                            if symbol and tr.entry_price > 0:
+                                # Only monitor buy orders (positions), not sell orders (TP/SL)
+                                if tr.side and tr.side.upper() == "BUY":
+                                    panic_threshold = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
+                                    trigger_price = tr.entry_price * (1.0 - panic_threshold / 100.0)
+                                    
+                                    self.logger.info(f"PANIC MONITOR: {symbol} entry={tr.entry_price:.6f} drop={panic_threshold:.2f}% trigger={trigger_price:.6f}")
+                                    
+                                    # Send notification about panic monitoring
+                                    try:
+                                        self.notifier.send_telegram(
+                                            f"🔍 PANIC MONITOR STARTED: {symbol} entry={tr.entry_price:.6f} drop={panic_threshold:.2f}% trigger={trigger_price:.6f}"
+                                        )
+                                    except Exception:
+                                        pass
+                                else:
+                                    self.logger.debug(f"PANIC MONITOR: Skipping {symbol} - not a buy order (side={tr.side})")
+                                    
+                        except Exception as e:
+                            self.logger.error(f"Error starting panic monitor for trade {tr.order_id}: {e}")
+                    
+                    self._last_panic_check_time = current_time
+                    
+        except Exception as e:
+            self.logger.error(f"Error in panic monitoring check: {e}")
 
     def _on_tg_signal(self, text: str) -> None:
         """Parse PumpScreener-like message and place a spot market buy on Bybit.

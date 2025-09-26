@@ -508,54 +508,46 @@ class OrderManager:
 
     def close_position_market(self, symbol: str, quantity: float) -> Optional[Dict]:
         try:
-            # 1) Best-effort: cancel protective TP/SL before closing to free reserved base
+            # 1) Cancel ALL open orders for this symbol to free reserved balance
             try:
-                sym_id = None
-                for rec in self.db.get_active_symbols():
-                    if rec.spot_symbol == symbol:
-                        sym_id = rec.id
-                        break
-                if sym_id is not None:
-                    tp_to_wait: str | None = None
-                    sl_to_wait: str | None = None
-                    for tr in self.db.get_open_trades():
-                        if tr.symbol_id == sym_id:
-                            try:
-                                if getattr(tr, "tp_order_id", None):
-                                    tp_to_wait = str(tr.tp_order_id)
-                                    self.cancel_order(symbol, tp_to_wait)
-                            except Exception:
-                                pass
-                            try:
-                                if getattr(tr, "sl_order_id", None):
-                                    sl_to_wait = str(tr.sl_order_id)
-                                    self.cancel_order(symbol, sl_to_wait)
-                            except Exception:
-                                pass
-                            break
-                    # Wait until cancellations take effect (orders disappear from open list)
-                    if self._http is not None and (tp_to_wait or sl_to_wait):
-                        deadline = time.time() + 2.0
-                        while time.time() < deadline:
-                            try:
-                                resp_open = self._http.request("get_open_orders", category="spot", symbol=symbol)
-                                if int(resp_open.get("retCode", -1)) != 0:
-                                    time.sleep(0.1)
-                                    continue
-                                rows = (resp_open.get("result", {}) or {}).get("list", [])
-                                ids = {str(r.get("orderId")) for r in rows if r.get("orderId")}
-                                still = False
-                                if tp_to_wait and tp_to_wait in ids:
-                                    still = True
-                                if sl_to_wait and sl_to_wait in ids:
-                                    still = True
-                                if not still:
-                                    break
-                            except Exception:
-                                pass
-                            time.sleep(0.15)
-            except Exception:
-                pass
+                if self._http is not None:
+                    # Get all open orders for this symbol
+                    resp_open = self._http.request("get_open_orders", category="spot", symbol=symbol)
+                    if int(resp_open.get("retCode", -1)) == 0:
+                        rows = (resp_open.get("result", {}) or {}).get("list", [])
+                        if rows:
+                            self.logger.info(f"Closing position: Found {len(rows)} open orders for {symbol}, cancelling all")
+                            
+                            # Cancel all orders
+                            for order in rows:
+                                order_id = str(order.get("orderId", ""))
+                                if order_id:
+                                    try:
+                                        self.cancel_order(symbol, order_id)
+                                        self.logger.debug(f"Cancelled order {order_id} for {symbol}")
+                                    except Exception as e:
+                                        self.logger.warning(f"Failed to cancel order {order_id} for {symbol}: {e}")
+                            
+                            # Wait for cancellations to take effect
+                            deadline = time.time() + 3.0
+                            while time.time() < deadline:
+                                try:
+                                    resp_check = self._http.request("get_open_orders", category="spot", symbol=symbol)
+                                    if int(resp_check.get("retCode", -1)) == 0:
+                                        remaining = (resp_check.get("result", {}) or {}).get("list", [])
+                                        if not remaining:
+                                            self.logger.info(f"All orders cancelled for {symbol}")
+                                            break
+                                        else:
+                                            self.logger.debug(f"Still {len(remaining)} orders remaining for {symbol}")
+                                    time.sleep(0.2)
+                                except Exception:
+                                    pass
+                            time.sleep(0.5)  # Additional wait for balance refresh
+                        else:
+                            self.logger.debug(f"No open orders found for {symbol}")
+            except Exception as e:
+                self.logger.error(f"Error cancelling orders for {symbol}: {e}")
 
             time.sleep(0.25)
 
@@ -690,10 +682,21 @@ class OrderManager:
             result = resp.get("result", {})
             rows = result.get("list", []) if isinstance(result, dict) else []
             remote_ids = {str(r.get("orderId")) for r in rows if r.get("orderId")}
-            for tr in self.db.get_open_trades():
+            
+            # Debug logging
+            self.logger.debug(f"SYNC CANCELLATIONS: Found {len(remote_ids)} open orders on exchange: {list(remote_ids)[:5]}...")
+            
+            open_trades = self.db.get_open_trades()
+            self.logger.debug(f"SYNC CANCELLATIONS: Found {len(open_trades)} open trades in DB")
+            
+            for tr in open_trades:
                 try:
+                    self.logger.debug(f"SYNC CANCELLATIONS: Checking trade {tr.order_id} (status: {tr.status})")
                     if str(tr.order_id) not in remote_ids:
+                        self.logger.warning(f"SYNC CANCELLATIONS: Marking trade {tr.order_id} as cancelled - not found in exchange orders")
                         self.db.set_trade_status(tr.order_id, "cancelled")
+                    else:
+                        self.logger.debug(f"SYNC CANCELLATIONS: Trade {tr.order_id} found in exchange orders - keeping status")
                 except Exception as e:
                     self.logger.debug(f"Failed to update cancelled for {tr.order_id}: {e}")
         except Exception as e:

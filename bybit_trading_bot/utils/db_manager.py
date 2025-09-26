@@ -22,6 +22,7 @@ class SymbolRecord:
 class TradeRecord:
     order_id: str
     symbol_id: int
+    side: str
     quantity: float
     entry_price: float
     take_profit_price: float
@@ -336,6 +337,14 @@ class DBManager:
         cur.execute("SELECT spot_symbol FROM symbols WHERE id = ?", (symbol_id,))
         row = cur.fetchone()
         return str(row["spot_symbol"]) if row else None
+
+    def get_symbol_id(self, spot_symbol: str) -> Optional[int]:
+        """Get symbol_id by spot_symbol."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM symbols WHERE spot_symbol = ?", (spot_symbol,))
+        row = cur.fetchone()
+        return int(row["id"]) if row else None
 
     # ---- Inserts ----
     def insert_price(self, symbol_id: int, price: float, ts: Optional[datetime] = None) -> None:
@@ -724,7 +733,7 @@ class DBManager:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT order_id, symbol_id, quantity, entry_price, take_profit_price, status, tp_order_id, close_order_id, close_price, fee_entry, fee_exit, sl_order_id, sl_price
+            SELECT order_id, symbol_id, side, quantity, entry_price, take_profit_price, status, tp_order_id, close_order_id, close_price, fee_entry, fee_exit, sl_order_id, sl_price
             FROM trades WHERE status = 'open'
             """
         )
@@ -733,6 +742,7 @@ class DBManager:
             TradeRecord(
                 order_id=str(r["order_id"]),
                 symbol_id=int(r["symbol_id"]),
+                side=str(r["side"]),
                 quantity=float(r["quantity"]),
                 entry_price=float(r["entry_price"]),
                 take_profit_price=float(r["take_profit_price"]),
