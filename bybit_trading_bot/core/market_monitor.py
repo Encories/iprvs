@@ -4,7 +4,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 from bybit_trading_bot.config.settings import Config
 from bybit_trading_bot.utils.logger import get_logger
@@ -15,6 +15,7 @@ from bybit_trading_bot.indicators.technical import calculate_rsi, calculate_macd
 from bybit_trading_bot.core.symbol_mapper import SymbolMapper
 from bybit_trading_bot.core.order_manager import OrderManager
 from bybit_trading_bot.core.software_sl_manager import SoftwareSLManager
+from bybit_trading_bot.core.oco_manager import OCOManager
 from bybit_trading_bot.handlers.spot_handler import SpotHandler
 from bybit_trading_bot.handlers.futures_handler import FuturesHandler
 from bybit_trading_bot.core.spike_detector import SpikeDetector, SpikeSignal
@@ -57,9 +58,20 @@ class MarketMonitor:
         self.symbol_mapper = SymbolMapper(self.config, self.db)
         self.order_manager = OrderManager(self.config, self.db)
         self.notifier = Notifier(self.config)
-        self.tg_listener = TelegramCommandListener(self.config, on_stop=self._activate_runtime_emergency, on_rate=self._build_rate_report, on_start=self._deactivate_runtime_emergency, on_signal=self._on_tg_signal, on_orders=self._build_open_orders_report, on_panics=self._build_panic_sell_report)
+        self.tg_listener = TelegramCommandListener(
+            self.config, 
+            on_stop=self._activate_runtime_emergency, 
+            on_rate=self._build_rate_report, 
+            on_start=self._deactivate_runtime_emergency, 
+            on_signal=self._on_tg_signal, 
+            on_orders=self._build_open_orders_report, 
+            on_panics=self._build_panic_sell_report,
+            on_oco=self._build_oco_report
+        )
         # Software SL manager
         self.software_sl = SoftwareSLManager(self.config, self.db, self.notifier)
+        # OCO manager (with notifier for Telegram)
+        self.oco_manager = OCOManager(self.config, self.db, notifier=self.notifier)
         self.spot = SpotHandler(testnet=self.config.bybit_testnet)
         self.futures = FuturesHandler(testnet=self.config.bybit_testnet)
         # Split mode state
@@ -147,9 +159,14 @@ class MarketMonitor:
     def _build_panic_sell_report(self) -> str:
         """Build a report of all active panic sell monitoring positions based on API data."""
         try:
-            # Check if panic sell is enabled
-            panic_enabled = getattr(self.config, "panic_sell_enabled", False)
+            # Check if panic is enabled
+            panic_enabled = getattr(self.config, "panic_enabled", True)
             if not panic_enabled:
+                return "Panic monitoring is disabled"
+            
+            # Check if panic sell is enabled
+            panic_sell_enabled = getattr(self.config, "panic_sell_enabled", False)
+            if not panic_sell_enabled:
                 return "Panic sell monitoring is disabled"
             
             # Get all open spot orders from API
@@ -223,12 +240,187 @@ class MarketMonitor:
             self.logger.error(f"Build panic sell report error: {e}")
             return "Panic sell report error"
 
+    def _build_oco_report(self) -> str:
+        """Build a report of all active OCO orders."""
+        try:
+            # Check if OCO is enabled
+            oco_enabled = getattr(self.config, "oco_enabled", False)
+            if not oco_enabled:
+                return "OCO orders are disabled"
+            
+            # Get active OCO orders
+            active_oco_orders = self.oco_manager.get_active_oco_orders()
+            if not active_oco_orders:
+                return "No active OCO orders"
+            
+            report_lines = [f"🎯 ACTIVE OCO ORDERS ({len(active_oco_orders)}):"]
+            report_lines.append("")
+            
+            for symbol, oco_order in active_oco_orders.items():
+                try:
+                    report_lines.append(f"📊 {symbol}:")
+                    report_lines.append(f"  Entry: {oco_order.entry_price:.6f}")
+                    report_lines.append(f"  Qty: {oco_order.quantity:.2f}")
+                    report_lines.append(f"  TP: {oco_order.tp_price:.6f} (ID: {oco_order.tp_order_id})")
+                    report_lines.append(f"  SL: {oco_order.sl_price:.6f} (ID: {oco_order.sl_order_id})")
+                    report_lines.append(f"  Status: {oco_order.status}")
+                    report_lines.append(f"  Created: {oco_order.created_at.strftime('%H:%M:%S')}")
+                    report_lines.append("")
+                
+                except Exception as e:
+                    self.logger.error(f"Error building OCO report for {symbol}: {e}")
+                    continue
+            
+            return "\n".join(report_lines)
+            
+        except Exception as e:
+            self.logger.error(f"Build OCO report error: {e}")
+            return "OCO report error"
+
+    def _perform_test_purchase(self) -> None:
+        """Perform test purchase of XPL/USDT with OCO orders."""
+        try:
+            symbol = "XPLUSDT"
+            test_amount_usdt = 10.0  # Increased from 2.0 to meet minimum order requirements
+            
+            self.logger.info(f"🧪 TEST PURCHASE: Starting test purchase of {symbol} for {test_amount_usdt} USDT")
+            
+            # Check if all components are ready
+            if not self.order_manager:
+                self.logger.error("TEST PURCHASE: OrderManager not available")
+                return
+            
+            if not self.oco_manager:
+                self.logger.error("TEST PURCHASE: OCOManager not available")
+                return
+            
+            if not self.db:
+                self.logger.error("TEST PURCHASE: Database not available")
+                return
+            
+            # Add delay before first API request
+            self.logger.info("TEST PURCHASE: Waiting 2 seconds before first API request...")
+            time.sleep(2.0)
+            
+            # Get current price
+            if not self.order_manager or not hasattr(self.order_manager, '_http') or not self.order_manager._http:
+                self.logger.error("TEST PURCHASE: API client not available")
+                return
+            
+            # Additional check for OCO manager
+            if not self.oco_manager or not hasattr(self.oco_manager, '_http') or not self.oco_manager._http:
+                self.logger.error("TEST PURCHASE: OCO API client not available")
+                return
+            
+            # Get ticker data for current price with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                resp = self.order_manager._http.request("get_tickers", category="spot", symbol=symbol)
+                if self._is_success(resp):
+                    break
+                
+                self.logger.warning(f"TEST PURCHASE: Attempt {attempt + 1} failed for {symbol}: {resp.get('retMsg')}")
+                
+                # If timestamp error, wait longer and retry
+                if resp.get('retCode') == 10002:
+                    wait_time = (attempt + 1) * 3  # 3, 6, 9 seconds
+                    self.logger.info(f"TEST PURCHASE: Timestamp error, waiting {wait_time} seconds and retrying...")
+                    time.sleep(wait_time)
+                else:
+                    break
+            
+            if not self._is_success(resp):
+                self.logger.error(f"TEST PURCHASE: All attempts failed for {symbol}: {resp.get('retMsg')}")
+                return
+            
+            tickers = resp.get("result", {}).get("list", [])
+            if not tickers:
+                self.logger.error(f"TEST PURCHASE: No ticker data for {symbol}")
+                return
+            
+            current_price = float(tickers[0].get("lastPrice", 0))
+            if current_price <= 0:
+                self.logger.error(f"TEST PURCHASE: Invalid price for {symbol}: {current_price}")
+                return
+            
+            # Calculate quantity for 2 USDT
+            quantity = test_amount_usdt / current_price
+            
+            self.logger.info(f"TEST PURCHASE: {symbol} current_price={current_price:.6f} quantity={quantity:.6f}")
+            
+            # Place OCO order directly (Buy with TP/SL)
+            # Use the same TP percent as the system uses for signals, not OCO_PROFIT_PERCENTAGE
+            oco_profit_pct = getattr(self.config, "take_profit_percent", getattr(self.config, "oco_profit_percentage", 2.0))
+            oco_loss_pct = getattr(self.config, "oco_loss_percentage", 2.0)
+            
+            oco_result = self.oco_manager.place_oco_orders(
+                symbol=symbol,
+                quantity=quantity,
+                entry_price=current_price,
+                profit_percentage=oco_profit_pct,
+                loss_percentage=oco_loss_pct
+            )
+            
+            if not oco_result['success']:
+                self.logger.error(f"TEST PURCHASE: Failed to place OCO order for {symbol}: {oco_result['message']}")
+                return
+            
+            # Save to database
+            try:
+                symbol_id = self.db.get_symbol_id(symbol)
+                if symbol_id:
+                    self.db.insert_trade(
+                        symbol_id=symbol_id,
+                        order_id=oco_result['order_id'],
+                        side="Buy",
+                        quantity=quantity,
+                        entry_price=current_price,
+                        take_profit_price=oco_result['tp_price'],
+                        status="open",
+                        tp_order_id=oco_result['order_id'],
+                        is_oco_order=True
+                    )
+                    self.logger.info(f"TEST PURCHASE: OCO trade saved to DB {symbol} order_id={oco_result['order_id']}")
+                else:
+                    self.logger.warning(f"TEST PURCHASE: Symbol {symbol} not found in DB")
+            except Exception as e:
+                self.logger.error(f"TEST PURCHASE: Failed to save OCO trade to DB: {e}")
+            
+            # Send notifications
+            try:
+                self.notifier.send_telegram(
+                    f"🧪 TEST PURCHASE COMPLETED: {symbol}\n"
+                    f"Entry: {current_price:.6f}\n"
+                    f"Qty: {quantity:.6f}\n"
+                    f"TP: {oco_result['tp_price']:.6f} (+{oco_profit_pct:.1f}%)\n"
+                    f"SL: {oco_result['sl_price']:.6f} (-{oco_loss_pct:.1f}%)\n"
+                    f"Order ID: {oco_result['order_id']}"
+                )
+            except Exception as e:
+                self.logger.error(f"TEST PURCHASE: Failed to send notification: {e}")
+            
+            self.logger.info(f"✅ TEST PURCHASE SUCCESS: {symbol} with OCO order placed")
+            
+        except Exception as e:
+            self.logger.error(f"TEST PURCHASE ERROR: {e}")
+
+    def _is_success(self, resp: Dict) -> bool:
+        """Check if API response is successful."""
+        if not isinstance(resp, dict):
+            return False
+        return int(resp.get("retCode", -1)) == 0
+
     def _monitor_panic_sell_from_api(self) -> None:
         """Monitor panic sell conditions based on API data from open orders."""
         try:
-            # Check if panic sell is enabled
-            panic_enabled = getattr(self.config, "panic_sell_enabled", False)
+            # Check if panic is enabled
+            panic_enabled = getattr(self.config, "panic_enabled", True)
             if not panic_enabled:
+                return
+            
+            # Check if panic sell is enabled
+            panic_sell_enabled = getattr(self.config, "panic_sell_enabled", False)
+            if not panic_sell_enabled:
                 return
             
             # Get all open spot orders from API
@@ -294,31 +486,32 @@ class MarketMonitor:
                                     if int(resp_open.get("retCode", -1)) == 0:
                                         rows = (resp_open.get("result", {}) or {}).get("list", [])
                                         if rows:
-                                            self.logger.info(f"PANIC SELL: Found {len(rows)} open orders for {symbol}, cancelling all")
-                                            
-                                            # Cancel all orders
-                                            for order in rows:
-                                                order_id = str(order.get("orderId", ""))
-                                                if order_id:
+                                            if getattr(self.config, "cancel_orders_enabled", True):
+                                                self.logger.info(f"PANIC SELL: Found {len(rows)} open orders for {symbol}, cancelling all")
+                                                # Cancel all orders
+                                                for order in rows:
+                                                    order_id = str(order.get("orderId", ""))
+                                                    if order_id:
+                                                        try:
+                                                            self.order_manager.cancel_order(symbol, order_id)
+                                                            self.logger.debug(f"PANIC SELL: Cancelled order {order_id} for {symbol}")
+                                                        except Exception as e:
+                                                            self.logger.warning(f"PANIC SELL: Failed to cancel order {order_id} for {symbol}: {e}")
+                                                # Wait for cancellations to take effect
+                                                deadline = time.time() + 3.0
+                                                while time.time() < deadline:
                                                     try:
-                                                        self.order_manager.cancel_order(symbol, order_id)
-                                                        self.logger.debug(f"PANIC SELL: Cancelled order {order_id} for {symbol}")
-                                                    except Exception as e:
-                                                        self.logger.warning(f"PANIC SELL: Failed to cancel order {order_id} for {symbol}: {e}")
-                                            
-                                            # Wait for cancellations to take effect
-                                            deadline = time.time() + 3.0
-                                            while time.time() < deadline:
-                                                try:
-                                                    resp_check = self.order_manager._http.request("get_open_orders", category="spot", symbol=symbol)
-                                                    if int(resp_check.get("retCode", -1)) == 0:
-                                                        remaining = (resp_check.get("result", {}) or {}).get("list", [])
-                                                        if not remaining:
-                                                            self.logger.info(f"PANIC SELL: All orders cancelled for {symbol}")
-                                                            break
-                                                    time.sleep(0.2)
-                                                except Exception:
-                                                    pass
+                                                        resp_check = self.order_manager._http.request("get_open_orders", category="spot", symbol=symbol)
+                                                        if int(resp_check.get("retCode", -1)) == 0:
+                                                            remaining = (resp_check.get("result", {}) or {}).get("list", [])
+                                                            if not remaining:
+                                                                self.logger.info(f"PANIC SELL: All orders cancelled for {symbol}")
+                                                                break
+                                                        time.sleep(0.2)
+                                                    except Exception:
+                                                        pass
+                                            else:
+                                                self.logger.info("PANIC SELL: Cancellation disabled; skipping order cancel phase")
                                             
                                             # Wait for balance refresh
                                             time.sleep(1.0)
@@ -326,7 +519,10 @@ class MarketMonitor:
                                 # Get available balance and sell at market
                                 available_qty = self.order_manager.get_available_base_qty(symbol, max_wait_s=3.0)
                                 if available_qty > 0:
-                                    sell_resp = self.order_manager.close_position_market(symbol, available_qty)
+                                    if getattr(self.config, "cancel_orders_enabled", True):
+                                        sell_resp = self.order_manager.close_position_market(symbol, available_qty)
+                                    else:
+                                        self.logger.info(f"Close disabled; skipping market close for {symbol}")
                                     if sell_resp:
                                         try:
                                             close_id = str(sell_resp.get("orderId") or sell_resp.get("result", {}).get("orderId")) if isinstance(sell_resp, dict) else None
@@ -440,12 +636,14 @@ class MarketMonitor:
                     self.db.update_trade_fees(trade.order_id, fee_exit=fee_exit)
                 except Exception:
                     pass
-            # best-effort cancel residual TP (exchange SL deprecated)
+            # best-effort cancel residual TP (exchange SL deprecated) — optional
             try:
-                if getattr(trade, "tp_order_id", None):
-                    # If the close is the TP fill itself, skip cancel to avoid noisy errors
-                    if not (close_order_id and str(close_order_id) == str(trade.tp_order_id)):
-                        self.order_manager.cancel_order(symbol, str(trade.tp_order_id))
+                if getattr(self.config, "cancel_orders_enabled", True):
+                    if getattr(trade, "tp_order_id", None):
+                        if not (close_order_id and str(close_order_id) == str(trade.tp_order_id)):
+                            self.order_manager.cancel_order(symbol, str(trade.tp_order_id))
+                else:
+                    self.logger.debug("Cancellation disabled; skipping residual TP cancel")
             except Exception:
                 pass
             notional = trade.entry_price * trade.quantity
@@ -577,6 +775,16 @@ class MarketMonitor:
         except Exception as e:
             self.logger.error(f"Failed to start Software SL Manager: {e}")
 
+        # Start OCO monitoring if enabled
+        try:
+            if getattr(self.config, "oco_enabled", False):
+                self.oco_manager.start_monitoring()
+                self.logger.info("OCO monitoring started")
+            else:
+                self.logger.info("OCO is disabled")
+        except Exception as e:
+            self.logger.error(f"Failed to start OCO Manager: {e}")
+
         # Initial backfill sync
         # Removed initial order sync to revert last change
 
@@ -593,6 +801,8 @@ class MarketMonitor:
 
         self.is_running = True
         self.logger.info("MarketMonitor started")
+
+        # Test purchase at startup disabled by request
 
     def stop_monitoring(self) -> None:
         """Корректная остановка всех процессов."""
@@ -616,6 +826,12 @@ class MarketMonitor:
         # Остановить Software SL Manager
         try:
             self.software_sl.stop()
+        except Exception:
+            pass
+
+        # Stop OCO monitoring
+        try:
+            self.oco_manager.stop_monitoring()
         except Exception:
             pass
 
@@ -755,7 +971,7 @@ class MarketMonitor:
         return ok, price_change, oi_change or 0.0
 
     def execute_trade_signal(self, symbol_id: int, price_change: float, oi_change: float) -> None:
-        """Выполнение торговой сделки при срабатывании сигнала с защитами и TP."""
+        """Выполнение торговой сделки при срабатывании сигнала с OCO ордером на покупку."""
         try:
             if not self._can_open_new_position(symbol_id):
                 return
@@ -784,6 +1000,35 @@ class MarketMonitor:
                     return
             except Exception:
                 pass
+            # If OCO is enabled, place a single Buy order with embedded TP/SL and exit
+            oco_enabled = getattr(self.config, "oco_enabled", False)
+            if oco_enabled:
+                try:
+                    oco_profit_pct = getattr(self.config, "take_profit_percent", getattr(self.config, "oco_profit_percentage", 2.0))
+                    oco_loss_pct = getattr(self.config, "oco_loss_percentage", 2.0)
+                    oco_result = self.oco_manager.place_oco_orders(
+                        symbol=symbol,
+                        quantity=qty,
+                        entry_price=last_price,
+                        profit_percentage=oco_profit_pct,
+                        loss_percentage=oco_loss_pct,
+                    )
+                    if not oco_result.get('success'):
+                        self.notifier.send_telegram(f"ORDER FAILED (OCO): {symbol} — {oco_result.get('message')}")
+                        return
+                    # Save OCO trade record
+                    try:
+                        order_id = str(oco_result.get('order_id'))
+                        self.db.insert_trade(symbol_id, order_id, "Buy", qty, last_price, 0.0, "open", stop_loss_price=None, tp_order_id=order_id, is_oco_order=True)
+                        self.logger.info(f"OCO TRADE SAVED TO DB: {symbol} order_id={order_id} entry={last_price:.6f} qty={qty}")
+                    except Exception as e:
+                        self.logger.error(f"FAILED TO SAVE OCO TRADE TO DB: {symbol} error={e}")
+                    # Do not duplicate Telegram placement notice here; OCOManager already sends it
+                except Exception as e:
+                    self.logger.error(f"Failed to place OCO order for {symbol}: {e}")
+                return
+
+            # Legacy path: place market/limit buy then manage TP normally
             tp_price = last_price * (1.0 + self.config.take_profit_percent / 100.0)
             order = self.order_manager.place_spot_order(
                 symbol,
@@ -815,23 +1060,61 @@ class MarketMonitor:
                     fee_entry = None
                 if fqty > 0.0:
                     safe_qty = self.order_manager.adjust_qty_for_safety(symbol, fqty)
-                    # Place TP first; if fails — emergency close and abort
-                    tp_resp = self.order_manager.place_tp_limit(symbol, safe_qty, tp_price)
-                    if not tp_resp:
+                    
+                    # Check if OCO is enabled
+                    oco_enabled = getattr(self.config, "oco_enabled", False)
+                    
+                    if oco_enabled:
+                        # Use OCO orders instead of regular TP
+                        # Use the same TP percent as the system uses for signals, not OCO_PROFIT_PERCENTAGE
+                        oco_profit_pct = getattr(self.config, "take_profit_percent", getattr(self.config, "oco_profit_percentage", 2.0))
+                        oco_loss_pct = getattr(self.config, "oco_loss_percentage", 2.0)
+                        
+                        oco_result = self.oco_manager.place_oco_orders(
+                            symbol=symbol,
+                            quantity=safe_qty,
+                            entry_price=avg,
+                            profit_percentage=oco_profit_pct,
+                            loss_percentage=oco_loss_pct
+                        )
+                        
+                        if not oco_result['success']:
+                            try:
+                                if getattr(self.config, "cancel_orders_enabled", True):
+                                    self.order_manager.close_position_market(symbol, safe_qty)
+                            except Exception:
+                                pass
+                            self.notifier.send_telegram(f"EMERGENCY CLOSE: {symbol} - failed to place OCO orders: {oco_result['message']}")
+                            return
+                        
+                        # Create trade record with OCO order ID
                         try:
-                            self.order_manager.close_position_market(symbol, safe_qty)
-                        except Exception:
-                            pass
-                        self.notifier.send_telegram(f"EMERGENCY CLOSE: {symbol} - failed to place TP")
-                        return
-                    # Create trade only after TP placed successfully
-                    try:
-                        tp_id = str(tp_resp.get("orderId") or tp_resp.get("result", {}).get("orderId") ) if tp_resp else None
-                        self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, avg, tp_price, "open", stop_loss_price=None, tp_order_id=tp_id)
-                        self.logger.info(f"TRADE SAVED TO DB: {symbol} order_id={order_id} entry={avg:.6f} qty={safe_qty} tp_id={tp_id}")
-                    except Exception as e:
-                        tp_id = None
-                        self.logger.error(f"FAILED TO SAVE TRADE TO DB: {symbol} order_id={order_id} error={e}")
+                            self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, avg, 0.0, "open", stop_loss_price=None, tp_order_id=oco_result['order_id'], is_oco_order=True)
+                            self.logger.info(f"OCO TRADE SAVED TO DB: {symbol} order_id={order_id} entry={avg:.6f} qty={safe_qty} oco_id={oco_result['order_id']}")
+                        except Exception as e:
+                            self.logger.error(f"FAILED TO SAVE OCO TRADE TO DB: {symbol} order_id={order_id} error={e}")
+                        
+                        # Do not send separate SL placement notification to avoid duplicates
+                    
+                    else:
+                        # Use regular TP (existing logic)
+                        tp_resp = self.order_manager.place_tp_limit(symbol, safe_qty, tp_price)
+                        if not tp_resp:
+                            try:
+                                if getattr(self.config, "cancel_orders_enabled", True):
+                                    self.order_manager.close_position_market(symbol, safe_qty)
+                            except Exception:
+                                pass
+                            self.notifier.send_telegram(f"EMERGENCY CLOSE: {symbol} - failed to place TP")
+                            return
+                        # Create trade only after TP placed successfully
+                        try:
+                            tp_id = str(tp_resp.get("orderId") or tp_resp.get("result", {}).get("orderId") ) if tp_resp else None
+                            self.db.insert_trade(symbol_id, order_id, "Buy", safe_qty, avg, tp_price, "open", stop_loss_price=None, tp_order_id=tp_id)
+                            self.logger.info(f"TRADE SAVED TO DB: {symbol} order_id={order_id} entry={avg:.6f} qty={safe_qty} tp_id={tp_id}")
+                        except Exception as e:
+                            tp_id = None
+                            self.logger.error(f"FAILED TO SAVE TRADE TO DB: {symbol} order_id={order_id} error={e}")
                     # update entry qty/fees
                     try:
                         self.db.update_trade_entry_qty(order_id, avg, safe_qty)
@@ -873,15 +1156,12 @@ class MarketMonitor:
                     except Exception:
                         expected_gross = None
                         expected_net = None
-                    extra = ""
-                    if expected_gross is not None:
-                        extra += f" expected_pnl={expected_gross:.4f}"
-                    if expected_net is not None:
-                        extra += f" expected_pnl_net={expected_net:.4f}"
-                    self.notifier.send_telegram(f"ORDER FILLED: {symbol} qty={safe_qty} avg={avg:.6f}{extra}")
+                    # Do not send extra ORDER FILLED telegram; OCO flow will notify on TP/SL
                     # Announce panic-monitor parameters immediately after fill
                     try:
-                        if getattr(self.config, "panic_sell_enabled", False):
+                        panic_enabled = getattr(self.config, "panic_enabled", True)
+                        panic_sell_enabled = getattr(self.config, "panic_sell_enabled", False)
+                        if panic_enabled and panic_sell_enabled:
                             ps = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
                             trigger = avg * (1.0 - abs(ps) / 100.0)
                             # Add order to notified set to prevent duplicate notifications
@@ -917,7 +1197,9 @@ class MarketMonitor:
             self.notifier.send_telegram(f"ORDER PLACED: {symbol} qty={safe_qty} entry={last_price:.6f} tp={tp_price:.6f}{extra}")
             # Announce panic-monitor parameters after placement when fill wasn't confirmed
             try:
-                if getattr(self.config, "panic_sell_enabled", False):
+                panic_enabled = getattr(self.config, "panic_enabled", True)
+                panic_sell_enabled = getattr(self.config, "panic_sell_enabled", False)
+                if panic_enabled and panic_sell_enabled:
                     ps = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
                     trigger = last_price * (1.0 - abs(ps) / 100.0)
                     # Add order to notified set to prevent duplicate notifications
@@ -1225,15 +1507,27 @@ class MarketMonitor:
                         # Prefer sync with existing TP order if it's already filled
                         try:
                             if getattr(tr, "tp_order_id", None):
+                                # For OCO orders we do not rely on legacy order history sync to close
+                                if getattr(tr, "is_oco_order", False):
+                                    continue
                                 row = self.order_manager.get_order_fill_row(str(tr.tp_order_id))
                                 if row and str(row.get("orderStatus", "")).lower() in {"filled", "partiallyfilled", "partially_filled"}:
                                     filled_qty = float(row.get("cumExecQty") or row.get("qty") or tr.quantity)
                                     close_price = float(row.get("avgPrice") or row.get("price") or tr.take_profit_price)
                                     # If partial fill: close entire position in one go to avoid double-close on the same trade record
-                                    if filled_qty < tr.quantity:
+                                    # But skip this for OCO orders as they handle TP/SL automatically
+                                    is_oco = getattr(tr, "is_oco_order", False)
+                                    self.logger.info(f"TP HIT (SYNC) CHECK: {symbol} filled_qty={filled_qty} quantity={tr.quantity} is_oco_order={is_oco}")
+                                    if filled_qty < tr.quantity and not is_oco:
                                         remaining = max(0.0, tr.quantity - filled_qty)
                                         if remaining > 0:
-                                            self.order_manager.close_position_market(symbol, remaining)
+                                            if getattr(self.config, "cancel_orders_enabled", True):
+                                                self.logger.info(f"TP HIT (SYNC): Closing remaining position for {symbol} qty={remaining}")
+                                                self.order_manager.close_position_market(symbol, remaining)
+                                            else:
+                                                self.logger.info("TP HIT (SYNC): Close disabled; skipping residual close")
+                                    elif is_oco:
+                                        self.logger.info(f"TP HIT (SYNC): Skipping auto-close for OCO order {symbol}")
                                     self._close_position_with_pnl(tr, symbol, close_price, "TP HIT (SYNC)", str(row.get("orderId")) if row.get("orderId") else None)
                                     try:
                                         self.software_sl.remove_sl_position(tr.order_id)
@@ -1242,7 +1536,9 @@ class MarketMonitor:
                                     continue
                         except Exception:
                             pass
-                        resp = self.order_manager.close_position_market(symbol, tr.quantity)
+                        resp = None
+                        if getattr(self.config, "cancel_orders_enabled", True):
+                            resp = self.order_manager.close_position_market(symbol, tr.quantity)
                         if resp:
                             try:
                                 close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
@@ -1265,16 +1561,19 @@ class MarketMonitor:
                             except Exception:
                                 pass
                         else:
-                            self.logger.error(f"TP close failed for {symbol} (order_id={tr.order_id}) - will retry")
+                            # OCO deals: suppress legacy TP close retry noise
+                            if not getattr(tr, "is_oco_order", False):
+                                self.logger.error(f"TP close failed for {symbol} (order_id={tr.order_id}) - will retry")
                     continue
                 # Ensure BE SL exists for filled orders even if initial fill was slow (delayed placement)
                 # Legacy exchange SL placement removed
 
                 # Panic sell: fast exit on small drop from entry (e.g., 2%)
                 try:
-                    panic_enabled = getattr(self.config, "panic_sell_enabled", False)
-                    self.logger.debug(f"PANIC SELL CONFIG: enabled={panic_enabled}, entry_price={tr.entry_price}")
-                    if panic_enabled and tr.entry_price > 0:
+                    panic_enabled = getattr(self.config, "panic_enabled", True)
+                    panic_sell_enabled = getattr(self.config, "panic_sell_enabled", False)
+                    self.logger.debug(f"PANIC SELL CONFIG: panic_enabled={panic_enabled}, panic_sell_enabled={panic_sell_enabled}, entry_price={tr.entry_price}")
+                    if panic_enabled and panic_sell_enabled and tr.entry_price > 0:
                         ps_thresh = float(getattr(self.config, "panic_sell_drop_pct", 2.0))
                         drop_pct_ps = (last_price - tr.entry_price) / tr.entry_price * 100.0
                         # Debug logging
@@ -1295,7 +1594,9 @@ class MarketMonitor:
                                 self.logger.warning(
                                     f"PANIC SELL TRIGGERED for {symbol}: drop={drop_pct_ps:.2f}% entry={tr.entry_price:.6f} last={last_price:.6f}"
                                 )
-                                resp = self.order_manager.close_position_market(symbol, tr.quantity)
+                                resp = None
+                                if getattr(self.config, "cancel_orders_enabled", True):
+                                    resp = self.order_manager.close_position_market(symbol, tr.quantity)
                                 if resp:
                                     try:
                                         close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
@@ -1334,7 +1635,9 @@ class MarketMonitor:
                         if drop_pct <= -abs(threshold_pct):
                             symbol = symbols_by_id.get(tr.symbol_id, "")
                             if symbol:
-                                resp = self.order_manager.close_position_market(symbol, tr.quantity)
+                                resp = None
+                                if getattr(self.config, "cancel_orders_enabled", True):
+                                    resp = self.order_manager.close_position_market(symbol, tr.quantity)
                                 if resp:
                                     try:
                                         close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
@@ -1364,6 +1667,9 @@ class MarketMonitor:
                 # If we have protective SL/TP orders and they filled outside our polling windows, detect via order history
                 try:
                     if getattr(tr, "tp_order_id", None):
+                        # Skip legacy sync for OCO trades
+                        if getattr(tr, "is_oco_order", False):
+                            continue
                         row = self.order_manager.get_order_fill_row(str(tr.tp_order_id))
                         if row and str(row.get("orderStatus", "")).lower() == "filled":
                             symbol = symbols_by_id.get(tr.symbol_id, "")
@@ -1395,10 +1701,11 @@ class MarketMonitor:
                         self._pending_signals.clear()
                     self._monitor_take_profit_once()
                     now = time.time()
-                    if now - self._last_sync_time >= 20.0:
-                        self.logger.debug(f"SYNC: Starting sync_cancellations (emergency) at {now}")
-                        self.order_manager.sync_cancellations()
-                        self._last_sync_time = now
+                    if getattr(self.config, "cancel_orders_enabled", True):
+                        if now - self._last_sync_time >= 20.0:
+                            self.logger.debug(f"SYNC: Starting sync_cancellations (emergency) at {now}")
+                            self.order_manager.sync_cancellations()
+                            self._last_sync_time = now
                     time.sleep(1.0)
                     continue
                     
@@ -1431,10 +1738,11 @@ class MarketMonitor:
                     last_panic_check = current_time
                     
                 now = time.time()
-                if now - self._last_sync_time >= 20.0:
-                    self.logger.debug(f"SYNC: Starting sync_cancellations at {now}")
-                    self.order_manager.sync_cancellations()
-                    self._last_sync_time = now
+                if getattr(self.config, "cancel_orders_enabled", True):
+                    if now - self._last_sync_time >= 20.0:
+                        self.logger.debug(f"SYNC: Starting sync_cancellations at {now}")
+                        self.order_manager.sync_cancellations()
+                        self._last_sync_time = now
                     
                 # Periodically check loss streak
                 self._check_loss_streak_and_stop()
@@ -1623,9 +1931,14 @@ class MarketMonitor:
     def _check_and_start_panic_monitoring(self) -> None:
         """Check if we have open orders and start panic monitoring if needed."""
         try:
-            # Check if panic sell is enabled
-            panic_enabled = getattr(self.config, "panic_sell_enabled", False)
+            # Check if panic is enabled
+            panic_enabled = getattr(self.config, "panic_enabled", True)
             if not panic_enabled:
+                return
+            
+            # Check if panic sell is enabled
+            panic_sell_enabled = getattr(self.config, "panic_sell_enabled", False)
+            if not panic_sell_enabled:
                 return
             
             # Get count of open orders

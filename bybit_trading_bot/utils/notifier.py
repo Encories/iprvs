@@ -37,7 +37,7 @@ class Notifier:
 
 
 class TelegramCommandListener:
-    def __init__(self, config: Config, on_stop: Callable[[], None], on_rate: Optional[Callable[[], str]] = None, on_start: Optional[Callable[[], None]] = None, on_signal: Optional[Callable[[str], None]] = None, on_orders: Optional[Callable[[], str]] = None, on_panics: Optional[Callable[[], str]] = None) -> None:
+    def __init__(self, config: Config, on_stop: Callable[[], None], on_rate: Optional[Callable[[], str]] = None, on_start: Optional[Callable[[], None]] = None, on_signal: Optional[Callable[[str], None]] = None, on_orders: Optional[Callable[[], str]] = None, on_panics: Optional[Callable[[], str]] = None, on_oco: Optional[Callable[[], str]] = None) -> None:
         self.config = config
         self.logger = get_logger(self.__class__.__name__)
         self._stop_event = threading.Event()
@@ -49,6 +49,7 @@ class TelegramCommandListener:
         self._on_signal = on_signal
         self._on_orders = on_orders
         self._on_panics = on_panics
+        self._on_oco = on_oco
 
     def start(self) -> None:
         if not (self.config.telegram_enabled and self.config.telegram_commands_enabled):
@@ -151,6 +152,12 @@ class TelegramCommandListener:
                             self._reply(chat_id, report)
                         except Exception as e:
                             self.logger.error(f"on_panics error: {e}")
+                    elif low in {"/oco", "oco"} and self._on_oco:
+                        try:
+                            report = self._on_oco() or "No OCO orders active"
+                            self._reply(chat_id, report)
+                        except Exception as e:
+                            self.logger.error(f"on_oco error: {e}")
                     elif self._on_signal and "|" in text and "open interest" in low:
                         # Raw forward from PumpScreener-like text
                         try:

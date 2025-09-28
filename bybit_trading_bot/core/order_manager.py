@@ -31,10 +31,53 @@ class OrderManager:
                     testnet=self.config.bybit_testnet,
                     api_key=self.config.bybit_api_key or "",
                     api_secret=self.config.bybit_api_secret or "",
+                    recv_window=30000,  # Increased to 30 seconds
                 )
                 self._http = RateLimitedHTTP(self._raw_http, max_requests=90, per_seconds=3.0)
+                
+                # Sync time with server before first request
+                self._sync_server_time()
             except Exception as e:
                 self.logger.error(f"Failed to init Bybit HTTP trading client: {e}")
+
+    def _sync_server_time(self) -> None:
+        """Sync local time with Bybit server to avoid timestamp errors."""
+        try:
+            # If cancellations are disabled and there are open orders, skip close to avoid reserved balance errors
+            try:
+                if self._http is not None and not getattr(self.config, "cancel_orders_enabled", True):
+                    resp_check_open = self._http.request("get_open_orders", category="spot", symbol=symbol)
+                    if int(resp_check_open.get("retCode", -1)) == 0:
+                        rows_open = (resp_check_open.get("result", {}) or {}).get("list", [])
+                        if rows_open:
+                            self.logger.info(f"Cancellation disabled and {len(rows_open)} open orders present; skipping market close for {symbol}")
+                            return None
+            except Exception:
+                pass
+            import requests
+            import json
+            
+            # Get server time from Bybit
+            url = "https://api.bybit.com/v5/market/time"
+            if self.config.bybit_testnet:
+                url = "https://api-testnet.bybit.com/v5/market/time"
+            
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                server_data = response.json()
+                server_time = int(server_data.get("result", {}).get("timeSecond", 0)) * 1000
+                local_time = int(time.time() * 1000)
+                
+                time_diff = server_time - local_time
+                self.logger.info(f"Server time sync: diff={time_diff}ms")
+                
+                # If difference is significant, we could adjust, but pybit handles this internally
+                if abs(time_diff) > 5000:  # More than 5 seconds difference
+                    self.logger.warning(f"Large time difference detected: {time_diff}ms")
+                    
+        except Exception as e:
+            self.logger.debug(f"Server time sync failed: {e}")
+            # Not critical, continue without sync
 
     def _get_symbol_filters(self, symbol: str) -> Dict[str, Decimal | str]:
         if symbol in self._symbol_cache:
@@ -508,17 +551,14 @@ class OrderManager:
 
     def close_position_market(self, symbol: str, quantity: float) -> Optional[Dict]:
         try:
-            # 1) Cancel ALL open orders for this symbol to free reserved balance
+            # 1) Optionally cancel ALL open orders for this symbol to free reserved balance
             try:
-                if self._http is not None:
-                    # Get all open orders for this symbol
+                if getattr(self.config, "cancel_orders_enabled", True) and self._http is not None:
                     resp_open = self._http.request("get_open_orders", category="spot", symbol=symbol)
                     if int(resp_open.get("retCode", -1)) == 0:
                         rows = (resp_open.get("result", {}) or {}).get("list", [])
                         if rows:
                             self.logger.info(f"Closing position: Found {len(rows)} open orders for {symbol}, cancelling all")
-                            
-                            # Cancel all orders
                             for order in rows:
                                 order_id = str(order.get("orderId", ""))
                                 if order_id:
@@ -527,8 +567,6 @@ class OrderManager:
                                         self.logger.debug(f"Cancelled order {order_id} for {symbol}")
                                     except Exception as e:
                                         self.logger.warning(f"Failed to cancel order {order_id} for {symbol}: {e}")
-                            
-                            # Wait for cancellations to take effect
                             deadline = time.time() + 3.0
                             while time.time() < deadline:
                                 try:
@@ -538,14 +576,14 @@ class OrderManager:
                                         if not remaining:
                                             self.logger.info(f"All orders cancelled for {symbol}")
                                             break
-                                        else:
-                                            self.logger.debug(f"Still {len(remaining)} orders remaining for {symbol}")
                                     time.sleep(0.2)
                                 except Exception:
                                     pass
-                            time.sleep(0.5)  # Additional wait for balance refresh
+                            time.sleep(0.5)
                         else:
                             self.logger.debug(f"No open orders found for {symbol}")
+                else:
+                    self.logger.info(f"Cancellation disabled; skipping order cancellations for {symbol}")
             except Exception as e:
                 self.logger.error(f"Error cancelling orders for {symbol}: {e}")
 

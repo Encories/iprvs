@@ -84,8 +84,15 @@ class Config:
     fee_rate: float
     drawdown_exit_threshold_pct: float
     # Panic sell on small drop
+    panic_enabled: bool
     panic_sell_enabled: bool
     panic_sell_drop_pct: float
+    # OCO orders
+    oco_enabled: bool
+    oco_profit_percentage: float
+    oco_loss_percentage: float
+    # Order cancellation control
+    cancel_orders_enabled: bool
     # Software SL params
     software_sl_check_interval: float
     software_sl_price_cache_ttl: float
@@ -192,8 +199,15 @@ def load_settings() -> Config:
     fee_rate = float(os.getenv("FEE_RATE", "0.001"))
     drawdown_exit_threshold_pct = float(os.getenv("DRAWDOWN_EXIT_THRESHOLD_PCT", "10.0"))
     # Panic sell on small drop after entry
+    panic_enabled = _get_bool(os.getenv("PANIC"), True)
     panic_sell_enabled = _get_bool(os.getenv("ENABLE_PANIC_SELL"), True)
     panic_sell_drop_pct = float(os.getenv("PANIC_SELL_DROP_PCT", "2.0"))
+    # OCO orders
+    oco_enabled = _get_bool(os.getenv("OCO_ENABLED"), False)
+    oco_profit_percentage = float(os.getenv("OCO_PROFIT_PERCENTAGE", "2.0"))
+    oco_loss_percentage = float(os.getenv("OCO_LOSS_PERCENTAGE", "2.0"))
+    # Order cancellation control
+    cancel_orders_enabled = _get_bool(os.getenv("CANCEL_ORDERS_ENABLED"), True)
     # Software SL
     software_sl_check_interval = float(os.getenv("SOFTWARE_SL_CHECK_INTERVAL", "1.0"))
     software_sl_price_cache_ttl = float(os.getenv("SOFTWARE_SL_PRICE_CACHE_TTL", "5.0"))
@@ -278,8 +292,13 @@ def load_settings() -> Config:
         split_trading_pairs=split_trading_pairs,
         fee_rate=fee_rate,
         drawdown_exit_threshold_pct=drawdown_exit_threshold_pct,
+        panic_enabled=panic_enabled,
         panic_sell_enabled=panic_sell_enabled,
         panic_sell_drop_pct=panic_sell_drop_pct,
+        oco_enabled=oco_enabled,
+        oco_profit_percentage=oco_profit_percentage,
+        oco_loss_percentage=oco_loss_percentage,
+        cancel_orders_enabled=cancel_orders_enabled,
         software_sl_check_interval=software_sl_check_interval,
         software_sl_price_cache_ttl=software_sl_price_cache_ttl,
         software_sl_heartbeat_enabled=software_sl_heartbeat_enabled,

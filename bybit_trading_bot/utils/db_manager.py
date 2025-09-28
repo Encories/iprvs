@@ -34,6 +34,7 @@ class TradeRecord:
     fee_exit: Optional[float] = None
     sl_order_id: Optional[str] = None
     sl_price: Optional[float] = None
+    is_oco_order: bool = False
 
 
 class DBManager:
@@ -183,6 +184,27 @@ class DBManager:
                 total_profit_loss REAL,
                 win_rate REAL
             );
+
+            -- OCO orders table
+            CREATE TABLE IF NOT EXISTS oco_orders (
+                id INTEGER PRIMARY KEY,
+                symbol_id INTEGER,
+                symbol TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                tp_order_id TEXT NOT NULL,
+                sl_order_id TEXT NOT NULL,
+                tp_price REAL NOT NULL,
+                sl_price REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMP,
+                FOREIGN KEY (symbol_id) REFERENCES symbols (id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_oco_orders_symbol_status ON oco_orders(symbol, status);
+            CREATE INDEX IF NOT EXISTS idx_oco_orders_tp_order_id ON oco_orders(tp_order_id);
+            CREATE INDEX IF NOT EXISTS idx_oco_orders_sl_order_id ON oco_orders(sl_order_id);
             """
         )
         conn.commit()
@@ -240,6 +262,10 @@ class DBManager:
                 cur.execute("ALTER TABLE trades ADD COLUMN sl_price REAL")
                 conn.commit()
                 self.logger.info("DB migration: added trades.sl_price column")
+            if "is_oco_order" not in tcols:
+                cur.execute("ALTER TABLE trades ADD COLUMN is_oco_order BOOLEAN DEFAULT 0")
+                conn.commit()
+                self.logger.info("DB migration: added trades.is_oco_order column")
             self._trades_has_symbol = True
         except Exception as e:
             self.logger.debug(f"trades columns detection failed: {e}")
@@ -571,6 +597,7 @@ class DBManager:
         status: str,
         stop_loss_price: Optional[float] = None,
         tp_order_id: Optional[str] = None,
+        is_oco_order: bool = False,
     ) -> int:
         conn = self._get_conn()
         cur = conn.cursor()
@@ -578,8 +605,8 @@ class DBManager:
         if self._trades_has_symbol and spot_symbol is not None:
             cur.execute(
                 """
-                INSERT INTO trades (symbol_id, spot_symbol, order_id, tp_order_id, side, quantity, entry_price, take_profit_price, status, stop_loss_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (symbol_id, spot_symbol, order_id, tp_order_id, side, quantity, entry_price, take_profit_price, status, stop_loss_price, is_oco_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol_id,
@@ -592,13 +619,14 @@ class DBManager:
                     float(take_profit_price),
                     status,
                     None if stop_loss_price is None else float(stop_loss_price),
+                    1 if is_oco_order else 0,
                 ),
             )
         else:
             cur.execute(
                 """
-                INSERT INTO trades (symbol_id, order_id, tp_order_id, side, quantity, entry_price, take_profit_price, status, stop_loss_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (symbol_id, order_id, tp_order_id, side, quantity, entry_price, take_profit_price, status, stop_loss_price, is_oco_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol_id,
@@ -610,6 +638,7 @@ class DBManager:
                     float(take_profit_price),
                     status,
                     None if stop_loss_price is None else float(stop_loss_price),
+                    1 if is_oco_order else 0,
                 ),
             )
         conn.commit()
@@ -733,12 +762,12 @@ class DBManager:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT order_id, symbol_id, side, quantity, entry_price, take_profit_price, status, tp_order_id, close_order_id, close_price, fee_entry, fee_exit, sl_order_id, sl_price
+            SELECT order_id, symbol_id, side, quantity, entry_price, take_profit_price, status, tp_order_id, close_order_id, close_price, fee_entry, fee_exit, sl_order_id, sl_price, is_oco_order
             FROM trades WHERE status = 'open'
             """
         )
         rows = cur.fetchall()
-        return [
+        trades = [
             TradeRecord(
                 order_id=str(r["order_id"]),
                 symbol_id=int(r["symbol_id"]),
@@ -754,9 +783,12 @@ class DBManager:
                 fee_exit=(float(r["fee_exit"]) if r["fee_exit"] is not None else None),
                 sl_order_id=(str(r["sl_order_id"]) if r["sl_order_id"] is not None else None),
                 sl_price=(float(r["sl_price"]) if r["sl_price"] is not None else None),
+                is_oco_order=bool(r["is_oco_order"]),
             )
             for r in rows
         ]
+        
+        return trades
 
     def set_trade_tp_order(self, order_id: str, tp_order_id: str) -> None:
         conn = self._get_conn()

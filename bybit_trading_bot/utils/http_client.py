@@ -71,6 +71,8 @@ class RateLimitedHTTP:
                 or "limit" in msg
                 or "timeout" in msg
                 or "temporarily" in msg
+                or "timestamp" in msg  # Retry on timestamp errors
+                or "recv_window" in msg  # Retry on recv_window errors
             )
         if isinstance(resp, dict):
             code = resp.get("retCode")
@@ -80,8 +82,8 @@ class RateLimitedHTTP:
                 code = int(code)
             except Exception:
                 return False
-            # Heuristic: non-zero retCode can be retried for transient cases
-            return code != 0
+            # Retry on timestamp errors (10002) and other transient errors
+            return code != 0 and code in [10002, 10003, 10004]  # Common timestamp/server errors
         return False
 
     def request(self, method_name: str, **kwargs) -> Any:
@@ -106,8 +108,12 @@ class RateLimitedHTTP:
                     raise err
                 return resp
 
-            # Backoff with jitter
-            backoff = min(self.backoff_cap, self.base_backoff * (2 ** attempt))
+            # Backoff with jitter - increased base backoff for timestamp errors
+            base_backoff = self.base_backoff
+            if isinstance(resp, dict) and resp.get("retCode") == 10002:
+                base_backoff = 1.0  # Longer base backoff for timestamp errors
+            
+            backoff = min(self.backoff_cap, base_backoff * (2 ** attempt))
             backoff *= 0.5 + random.random()  # jitter 0.5x..1.5x
             self.logger.warning(
                 f"Rate/backoff: method={method_name} attempt={attempt+1} sleeping={backoff:.2f}s"
