@@ -828,6 +828,21 @@ class DBManager:
         row = cur.fetchone()
         return datetime.fromisoformat(row["created_at"]) if row and row["created_at"] else None
 
+    def get_trade_created_at(self, order_id: str) -> Optional[datetime]:
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT created_at FROM trades WHERE order_id = ? LIMIT 1
+            """,
+            (order_id,),
+        )
+        row = cur.fetchone()
+        try:
+            return datetime.fromisoformat(row["created_at"]) if row and row["created_at"] else None
+        except Exception:
+            return None
+
     def get_last_price(self, symbol_id: int) -> Optional[float]:
         conn = self._get_conn()
         cur = conn.cursor()

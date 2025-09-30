@@ -69,6 +69,8 @@ class MarketMonitor:
         self._last_analyzer_summary: float = 0.0
         self._runtime_emergency_stop: bool = False
         self._loss_notify_sent: bool = False
+        # Lightweight recent prices buffer for TP reach forecasting: {symbol_id: [(ts_epoch, price), ...]}
+        self._recent_prices: dict[int, list[tuple[float, float]]] = {}
 
     def _build_rate_report(self) -> str:
         try:
@@ -296,6 +298,17 @@ class MarketMonitor:
             last_price = self.db.get_last_price(symbol_id) or 0.0
             if last_price <= 0.0:
                 return
+            # Forecast-based gating to reduce hanging TPs
+            try:
+                if self.config.tp_forecast_enabled:
+                    score = self._estimate_tp_reach_probability(symbol_id)
+                    if score is not None and score < float(self.config.tp_forecast_min_score):
+                        self.logger.debug(
+                            f"Skip entry by forecast: {symbol} score={score:.2f} < {self.config.tp_forecast_min_score}"
+                        )
+                        return
+            except Exception as e:
+                self.logger.debug(f"Forecast gate error for {symbol}: {e}")
             qty = self.order_manager.calculate_position_size(
                 symbol=symbol,
                 current_price=last_price,
@@ -412,6 +425,27 @@ class MarketMonitor:
             rec = next((r for r in records if r.spot_symbol == symbol), None)
             if rec:
                 self.db.insert_price(rec.id, price)
+                # Keep recent price buffer for TP forecasting
+                buf = self._recent_prices.get(rec.id)
+                if buf is None:
+                    buf = []
+                    self._recent_prices[rec.id] = buf
+                buf.append((float(ts_epoch), float(price)))
+                # Trim buffer to horizon minutes
+                try:
+                    horizon_min = max(5, int(self.config.tp_forecast_horizon_minutes))
+                except Exception:
+                    horizon_min = 15
+                cutoff = float(ts_epoch) - horizon_min * 60.0
+                # Drop old entries
+                drop = 0
+                for t, _ in buf:
+                    if t < cutoff:
+                        drop += 1
+                    else:
+                        break
+                if drop > 0:
+                    del buf[:drop]
         except Exception as e:
             self.logger.debug(f"Failed to persist price for {symbol}: {e}")
 
@@ -494,6 +528,53 @@ class MarketMonitor:
             det.update_market_data(price, max(qty, 0.0), datetime.utcnow())
         except Exception as e:
             self.logger.debug(f"Split trade error {symbol}: {e}")
+
+    # --- Forecasting helpers ---
+    def _estimate_tp_reach_probability(self, symbol_id: int) -> float | None:
+        """Грубая эвристика вероятности достижения TP в [0,1].
+        Учитывает:
+        - импульс за горизонт по последним тикам
+        - локальный наклон (усреднение квартилей)
+        - опционально вклад стакана из split-детектора (узкий спред + дисбаланс bid>ask)
+        """
+        try:
+            buf = self._recent_prices.get(symbol_id)
+            if not buf or len(buf) < 5:
+                return None
+            prices = [p for (_, p) in buf]
+            p0 = prices[0]
+            plast = prices[-1]
+            if p0 <= 0.0:
+                return None
+            momentum = (plast - p0) / p0  # доля роста за горизонт
+            q = max(2, len(prices) // 4)
+            first = prices[:q]
+            last = prices[-q:]
+            if not first or not last:
+                return None
+            s0 = sum(first) / len(first)
+            s1 = sum(last) / len(last)
+            slope = 0.0 if s0 == 0 else (s1 - s0) / s0
+            score = 0.0
+            if momentum > 0:
+                score += min(0.5, momentum * 2.0)
+            if slope > 0:
+                score += min(0.3, slope * 3.0)
+            if getattr(self.config, "tp_forecast_use_orderbook", False):
+                try:
+                    rec = next((r for r in self.db.get_active_symbols() if r.id == symbol_id), None)
+                    if rec is not None:
+                        det = self._split_detectors.get(rec.spot_symbol)
+                        if det and det.last_spread is not None and det.last_imbalance is not None:
+                            if det.last_spread <= float(self.config.bid_ask_spread_threshold):
+                                imb = max(0.0, float(det.last_imbalance))
+                                score += min(0.2, imb * 0.4)
+                except Exception:
+                    pass
+            return max(0.0, min(1.0, score))
+        except Exception as e:
+            self.logger.debug(f"Forecast calc error sym_id={symbol_id}: {e}")
+            return None
 
     def _run_oi_poll(self) -> None:
         self.logger.info("OI polling worker started")
@@ -585,8 +666,8 @@ class MarketMonitor:
                     time.sleep(2.0)
                     continue
                 for rec in symbols:
-                    # Verbose: print which pair is being analyzed
-                    self.logger.info(f"Analyzing: {rec.spot_symbol}")
+                    # Reduced verbosity: keep analyzer quiet per request
+                    # self.logger.debug(f"Analyzing: {rec.spot_symbol}")
                     ok, pchg, oichg = self.check_trading_conditions(rec.id)
                     # lightweight observability: log when near thresholds
                     if not ok and (pchg >= self.config.price_change_threshold * 0.8 or oichg >= self.config.oi_change_threshold * 0.8):
@@ -680,6 +761,60 @@ class MarketMonitor:
                         else:
                             self.logger.error(f"TP close failed for {symbol} (order_id={tr.order_id}) - will retry")
                     continue
+                # Time-stop exit: close if trade age exceeds configured minutes
+                try:
+                    if self.config.time_stop_enabled:
+                        created_at = self.db.get_trade_created_at(tr.order_id)
+                        if created_at is not None:
+                            age_min = (datetime.utcnow() - created_at).total_seconds() / 60.0
+                            if age_min >= float(self.config.time_stop_minutes):
+                                symbol = symbols_by_id.get(tr.symbol_id, "")
+                                if symbol:
+                                    resp = self.order_manager.close_position_market(symbol, tr.quantity)
+                                    if resp:
+                                        close_price = last_price
+                                        try:
+                                            close_id = str(resp.get("orderId") or resp.get("result", {}).get("orderId")) if isinstance(resp, dict) else None
+                                        except Exception:
+                                            close_id = None
+                                        if close_id:
+                                            row = self.order_manager.wait_for_filled(close_id, timeout_s=5.0)
+                                            try:
+                                                if isinstance(row, dict):
+                                                    cp = row.get("avgPrice") or row.get("price")
+                                                    if cp is not None:
+                                                        close_price = float(cp)
+                                            except Exception:
+                                                pass
+                                        # net PnL with fees
+                                        try:
+                                            fee_rate = float(self.config.fee_rate)
+                                        except Exception:
+                                            fee_rate = 0.001
+                                        fee_entry = tr.entry_price * tr.quantity * fee_rate
+                                        fee_exit = close_price * tr.quantity * fee_rate
+                                        pnl_net = (close_price - tr.entry_price) * tr.quantity - (fee_entry + fee_exit)
+                                        self.db.close_trade(tr.order_id, pnl_net)
+                                        try:
+                                            if close_id:
+                                                self.db.set_trade_close_info(tr.order_id, close_id, close_price)
+                                            self.db.update_trade_fees(tr.order_id, fee_exit=fee_exit)
+                                        except Exception:
+                                            pass
+                                        msg = (
+                                            f"TIME-STOP EXIT: {symbol} age_min={age_min:.1f} qty={tr.quantity} "
+                                            f"entry={tr.entry_price:.6f} close={close_price:.6f} pnl_net={pnl_net:.4f}"
+                                        )
+                                        try:
+                                            self.notifier.send_telegram(msg)
+                                        except Exception:
+                                            pass
+                                        self.logger.info(msg)
+                                    else:
+                                        self.logger.error(f"Time-stop close failed for {symbol} (order_id={tr.order_id}) - will retry")
+                                continue
+                except Exception as e:
+                    self.logger.debug(f"Time-stop handler error: {e}")
                 # Emergency drawdown SL: if price falls >= 10% from entry, market exit
                 try:
                     threshold_pct = 10.0  # fixed drawdown threshold

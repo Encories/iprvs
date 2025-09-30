@@ -17,7 +17,6 @@ import random
 TickerCallback = Callable[[str, float, float], None]
 OrderbookCallback = Callable[[str, float, float, list, list], None]
 TradeCallback = Callable[[str, float, float, float], None]
-TradeCallback = Callable[[str, float, float, float], None]
 
 
 class WebSocketHandler:
@@ -40,7 +39,7 @@ class WebSocketHandler:
         self._stop_event = threading.Event()
         self._base_backoff = 1.0
         self._backoff_cap = 30.0
-        self._stale_seconds = 15.0  # no ticks for this duration → reconnect
+        self._stale_seconds = 6.0  # no ticks for this duration → reconnect faster
 
         if WebSocket is not None:
             try:
@@ -59,6 +58,7 @@ class WebSocketHandler:
         try:
             for sym in symbols:
                 self._ws.ticker_stream(callback=(lambda msg, s=sym: self._on_raw_ticker(msg, s, on_ticker)), symbol=sym)
+                time.sleep(0.03)  # gentle pacing to avoid server throttling
             self._last_tick_time = time.time()
             self.logger.info(f"Subscribed to {len(symbols)} spot tickers")
         except Exception as e:
@@ -96,6 +96,7 @@ class WebSocketHandler:
                     self._ws.public_trade_stream(callback=(lambda msg, s=sym: self._on_raw_trade(msg, s, on_trade)), symbol=sym)  # type: ignore[attr-defined]
                 except Exception as e:
                     self.logger.debug(f"Trade subscribe not available for {sym}: {e}")
+                time.sleep(0.03)  # pacing
             self._last_tick_time = time.time()
             self.logger.info(f"Subscribed orderbook/trades for {len(symbols)} symbols")
         except Exception as e:
@@ -138,6 +139,8 @@ class WebSocketHandler:
         if WebSocket is None:
             return False
         try:
+            # Best-effort close previous connection before re-init
+            self._safe_close_ws()
             self._ws = WebSocket(testnet=self.testnet, channel_type="spot")
             return True
         except Exception as e:
@@ -170,6 +173,7 @@ class WebSocketHandler:
                 self._ws.public_trade_stream(callback=(lambda msg, s=sym: self._on_raw_trade(msg, s, on_trade)), symbol=sym)  # type: ignore[attr-defined]
             except Exception:
                 pass
+            time.sleep(0.03)
         self._last_tick_time = time.time()
         self.logger.info(f"Resubscribed to {len(symbols)} spot tickers")
 
@@ -183,7 +187,10 @@ class WebSocketHandler:
                     self.logger.warning(
                         f"WS stale or closed. Reconnecting (backoff {backoff:.1f}s)..."
                     )
-                    time.sleep(backoff * (0.5 + random.random()))  # jitter
+                    # small jittered delay before reconnect attempt
+                    time.sleep(backoff * (0.5 + random.random()))
+                    # ensure old connection is closed before re-init
+                    self._safe_close_ws()
                     if self._ensure_ws():
                         try:
                             self._resubscribe_all()
@@ -197,6 +204,25 @@ class WebSocketHandler:
             except Exception as e:
                 self.logger.error(f"WS monitor error: {e}")
                 time.sleep(2.0)
+
+    def _safe_close_ws(self) -> None:
+        """Attempt to gracefully close underlying WebSocket if supported by pybit."""
+        try:
+            ws = self._ws
+            self._ws = None
+            if ws is None:
+                return
+            # Try common close methods defensively
+            for method_name in ("stop", "close", "exit", "shutdown"):
+                try:
+                    m = getattr(ws, method_name, None)
+                    if callable(m):
+                        m()
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def _on_raw_orderbook(self, message, symbol: str, on_orderbook: Optional[OrderbookCallback]) -> None:
         if not callable(on_orderbook):
@@ -271,4 +297,4 @@ class WebSocketHandler:
         except Exception:
             pass
         self._monitor_thread = None
-        self._ws = None 
+        self._safe_close_ws()

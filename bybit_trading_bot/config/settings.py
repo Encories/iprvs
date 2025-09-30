@@ -67,6 +67,14 @@ class Config:
     split_trading_pairs: Optional[str]
     # Fees
     fee_rate: float
+    # TP forecast gating
+    tp_forecast_enabled: bool
+    tp_forecast_horizon_minutes: int
+    tp_forecast_min_score: float
+    tp_forecast_use_orderbook: bool
+    # Time-stop exit
+    time_stop_enabled: bool
+    time_stop_minutes: int
 
 
 def _get_bool(value: str | None, default: bool) -> bool:
@@ -136,6 +144,14 @@ def load_settings() -> Config:
     split_max_open_orders = int(os.getenv("SPLIT_MAX_OPEN_ORDERS", "3"))
     split_trading_pairs = os.getenv("SPLIT_TRADING_PAIRS")
     fee_rate = float(os.getenv("FEE_RATE", "0.001"))
+    # TP forecast gating
+    tp_forecast_enabled = _get_bool(os.getenv("TP_FORECAST_ENABLED"), True)
+    tp_forecast_horizon_minutes = int(os.getenv("TP_FORECAST_HORIZON_MINUTES", "15"))
+    tp_forecast_min_score = float(os.getenv("TP_FORECAST_MIN_SCORE", "0.65"))
+    tp_forecast_use_orderbook = _get_bool(os.getenv("TP_FORECAST_USE_ORDERBOOK"), True)
+    # Time-stop exit
+    time_stop_enabled = _get_bool(os.getenv("TIME_STOP_ENABLED"), True)
+    time_stop_minutes = int(os.getenv("TIME_STOP_MINUTES", "30"))
 
     return Config(
         bybit_api_key=bybit_api_key,
@@ -187,4 +203,10 @@ def load_settings() -> Config:
         split_max_open_orders=split_max_open_orders,
         split_trading_pairs=split_trading_pairs,
         fee_rate=fee_rate,
+        tp_forecast_enabled=tp_forecast_enabled,
+        tp_forecast_horizon_minutes=tp_forecast_horizon_minutes,
+        tp_forecast_min_score=tp_forecast_min_score,
+        tp_forecast_use_orderbook=tp_forecast_use_orderbook,
+        time_stop_enabled=time_stop_enabled,
+        time_stop_minutes=time_stop_minutes,
     ) 
