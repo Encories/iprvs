@@ -406,6 +406,7 @@ class OrderManager:
         try:
             qty_str = self._normalize_and_format_qty(symbol, quantity, price)
             price_str = self._format_price(symbol, price)
+            # Prefer PostOnly to avoid taker fees on entries when possible
             if self._http is None:
                 order = {
                     "orderId": f"DEV-LMT-{symbol}-{qty_str}-{price_str}",
@@ -425,6 +426,7 @@ class OrderManager:
                 qty=qty_str,
                 price=price_str,
                 timeInForce="GTC",
+                isPostOnly=True,
             )
             if not self._is_success(resp):
                 self.logger.error(f"Failed to place limit for {symbol}: retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")

@@ -10,12 +10,16 @@ from bybit_trading_bot.config.settings import Config
 from bybit_trading_bot.utils.logger import get_logger
 from bybit_trading_bot.utils.db_manager import DBManager
 from bybit_trading_bot.utils.notifier import Notifier, TelegramCommandListener
-from bybit_trading_bot.core.data_processor import calculate_percentage_change, meets_thresholds
+from bybit_trading_bot.core.data_processor import calculate_percentage_change
 from bybit_trading_bot.core.symbol_mapper import SymbolMapper
 from bybit_trading_bot.core.order_manager import OrderManager
 from bybit_trading_bot.handlers.spot_handler import SpotHandler
 from bybit_trading_bot.handlers.futures_handler import FuturesHandler
-from bybit_trading_bot.core.spike_detector import SpikeDetector, SpikeSignal
+from bybit_trading_bot.core.spike_detector import SpikeDetector
+from bybit_trading_bot.utils.correlation_guard import CorrelationGuard, CorrelationGuardConfig
+from bybit_trading_bot.position.manager import AdvancedPositionManager
+from bybit_trading_bot.analytics.volume_signals import VolumeSignalAnalyzer, VolumeConfig
+from bybit_trading_bot.filters.mtf_filter import MultiTimeframeFilter, MTFConfig
 
 try:
     from pybit.unified_trading import HTTP as BYBIT_HTTP
@@ -55,12 +59,14 @@ class MarketMonitor:
         self.symbol_mapper = SymbolMapper(self.config, self.db)
         self.order_manager = OrderManager(self.config, self.db)
         self.notifier = Notifier(self.config)
+        self.position_manager = AdvancedPositionManager(self.config, self.db, self.order_manager, self.notifier)
         self.tg_listener = TelegramCommandListener(self.config, on_stop=self._activate_runtime_emergency, on_rate=self._build_rate_report, on_start=self._deactivate_runtime_emergency, on_signal=self._on_tg_signal)
         self.spot = SpotHandler(testnet=self.config.bybit_testnet)
         self.futures = FuturesHandler(testnet=self.config.bybit_testnet)
         # Split mode state
         self._split_detectors: dict[str, SpikeDetector] = {}
         self._split_last_price: dict[str, float] = {}
+        self._corr_guard = CorrelationGuard(CorrelationGuardConfig())
 
         # Queues
         self._pending_signals: List[Signal] = []
@@ -71,6 +77,42 @@ class MarketMonitor:
         self._loss_notify_sent: bool = False
         # Lightweight recent prices buffer for TP reach forecasting: {symbol_id: [(ts_epoch, price), ...]}
         self._recent_prices: dict[int, list[tuple[float, float]]] = {}
+        # Simple runtime metrics
+        try:
+            from bybit_trading_bot.analytics.metrics import FillMetrics
+            self._metrics = FillMetrics()
+        except Exception:
+            self._metrics = None
+        # Split stats (per-interval summary)
+        self._split_stats = {
+            "signals": 0,
+            "orders": 0,
+            "blocked_micro": 0,
+            "blocked_obv": 0,
+            "blocked_mtf": 0,
+            "blocked_corr": 0,
+        }
+        self._last_split_summary = 0.0
+        # Analyzers/filters
+        try:
+            self._vol_analyzer = VolumeSignalAnalyzer(
+                VolumeConfig(
+                    obv_enabled=bool(self.config.obv_enabled),
+                    obv_trend_periods=int(self.config.obv_trend_periods),
+                    volume_quality_check=bool(self.config.volume_quality_check),
+                )
+            )
+        except Exception:
+            self._vol_analyzer = None
+        try:
+            self._mtf_filter = MultiTimeframeFilter(
+                MTFConfig(
+                    enabled=bool(self.config.mtf_enabled),
+                    require_confirmation=bool(self.config.mtf_require_confirmation),
+                )
+            )
+        except Exception:
+            self._mtf_filter = None
 
     def _build_rate_report(self) -> str:
         try:
@@ -138,7 +180,7 @@ class MarketMonitor:
                 else:
                     symbols = [rec.spot_symbol for rec in self.db.get_active_symbols()]
                 for sym in symbols:
-                    self._split_detectors[sym] = SpikeDetector(self.config, order_manager=self.order_manager)
+                    self._split_detectors[sym] = SpikeDetector(self.config, order_manager=self.order_manager, db=self.db)
                 if symbols:
                     # Subscribe tickers and orderbook/trades; route to split handlers
                     self.spot.subscribe_tickers_with_callback(symbols, self._on_split_ticker)
@@ -460,6 +502,31 @@ class MarketMonitor:
         self.logger.info("Split mode loop started")
         while not self._stop_event.is_set():
             try:
+                # Heartbeat summary every 60s
+                now = time.time()
+                if now - getattr(self, "_last_split_summary", 0.0) >= 60.0:
+                    try:
+                        fill_rate = None
+                        avg_slip = None
+                        if self._metrics is not None:
+                            fill_rate = self._metrics.fill_rate
+                            avg_slip = self._metrics.avg_slippage_bp
+                        sym_count = len(self._split_detectors)
+                        msg = (
+                            f"Split summary: symbols={sym_count} signals={self._split_stats['signals']} orders={self._split_stats['orders']} "
+                            f"blocked[micro={self._split_stats['blocked_micro']},obv={self._split_stats['blocked_obv']},mtf={self._split_stats['blocked_mtf']},corr={self._split_stats['blocked_corr']}]"
+                        )
+                        if fill_rate is not None:
+                            msg += f" fill_rate={fill_rate:.2f}"
+                        if avg_slip is not None:
+                            msg += f" avg_slip_bp={avg_slip:.1f}"
+                        self.logger.info(msg)
+                        # reset window counters
+                        for k in self._split_stats:
+                            self._split_stats[k] = 0 if k not in {"signals", "orders", "blocked_micro", "blocked_obv", "blocked_mtf", "blocked_corr"} else 0
+                    except Exception:
+                        pass
+                    self._last_split_summary = now
                 time.sleep(0.2)
             except Exception:
                 time.sleep(0.5)
@@ -469,7 +536,7 @@ class MarketMonitor:
         try:
             det = self._split_detectors.get(symbol)
             if det is None:
-                det = SpikeDetector(self.config, order_manager=self.order_manager)
+                det = SpikeDetector(self.config, order_manager=self.order_manager, db=self.db)
                 self._split_detectors[symbol] = det
             prev = self._split_last_price.get(symbol)
             pseudo_vol = 0.0
@@ -479,6 +546,11 @@ class MarketMonitor:
                 except Exception:
                     pseudo_vol = 0.0
             self._split_last_price[symbol] = price
+            # update correlation guard with observed price (for returns calc)
+            try:
+                self._corr_guard.update_price(symbol, ts_epoch, price)
+            except Exception:
+                pass
             det.update_market_data(price, max(pseudo_vol, 0.0), datetime.utcnow())
             sig = det.generate_trading_signal(symbol)
             if sig and sig.strength >= float(self.config.split_min_signal_strength):
@@ -490,8 +562,53 @@ class MarketMonitor:
                     pass
                 # cooldown
                 last_sp = self.db.get_last_sp_signal_time(symbol)
-                if last_sp is not None and (datetime.utcnow() - last_sp) < timedelta(minutes=self.config.cooldown_minutes_split):
+                if last_sp is not None and (datetime.utcnow() - last_sp) < timedelta(minutes=max(1, int(self.config.cooldown_minutes_split))):
                     return
+                # Microstructure filters: spread and orderbook imbalance
+                try:
+                    if det.last_spread is not None and det.last_spread > float(self.config.bid_ask_spread_threshold):
+                        self._split_stats["blocked_micro"] += 1
+                        self.logger.debug(f"Gate blocked (spread): {symbol} spread={det.last_spread:.6f} > thr={float(self.config.bid_ask_spread_threshold):.6f}")
+                        return
+                    if det.last_imbalance is not None and det.last_imbalance < float(self.config.orderbook_imbalance_threshold):
+                        self._split_stats["blocked_micro"] += 1
+                        self.logger.debug(f"Gate blocked (imbalance): {symbol} imb={det.last_imbalance:.3f} < thr={float(self.config.orderbook_imbalance_threshold):.3f}")
+                        return
+                except Exception:
+                    pass
+                # OBV/Volume quality gating
+                try:
+                    if self._vol_analyzer is not None:
+                        prices = list(det.price_buffer)
+                        volumes = list(det.volume_buffer)
+                        lookback = max(5, int(self.config.volume_lookback_periods))
+                        spike_ratio = self._vol_analyzer.detect_volume_spike(volumes, lookback, float(self.config.volume_spike_multiplier))
+                        obv_slope = self._vol_analyzer.calculate_obv_trend(prices, volumes)
+                        price_dir = 0
+                        if len(prices) >= 2:
+                            price_dir = 1 if prices[-1] > prices[-2] else (-1 if prices[-1] < prices[-2] else 0)
+                        vol_ok = self._vol_analyzer.validate_volume_quality(spike_ratio, obv_slope, price_dir)
+                        if bool(self.config.require_obv_confirmation) and not vol_ok:
+                            self._split_stats["blocked_obv"] += 1
+                            self.logger.debug(f"Gate blocked (OBV/volume): {symbol} spike={spike_ratio:.2f} obv_slope={obv_slope:.2f} dir={price_dir}")
+                            return
+                except Exception:
+                    pass
+                # MTF trend confirmation
+                try:
+                    if self._mtf_filter is not None and bool(self.config.mtf_enabled):
+                        trend = self._mtf_filter.get_trend_direction(symbol)
+                        if not self._mtf_filter.validate_entry_signal("long", trend):
+                            self._split_stats["blocked_mtf"] += 1
+                            self.logger.debug(f"Gate blocked (MTF): {symbol} trend={trend}")
+                            return
+                except Exception:
+                    pass
+                # Count allowed signal
+                try:
+                    self._split_stats["signals"] += 1
+                except Exception:
+                    pass
                 signal_id = self.db.insert_sp_signal(
                     timestamp=sig.timestamp,
                     symbol=symbol,
@@ -500,9 +617,31 @@ class MarketMonitor:
                     price=sig.price,
                     volume=sig.volume,
                 )
+                # Correlation guard: block entry if highly correlated with recent active long
+                import time as _time
+                if not self._corr_guard.ok(symbol, _time.time()):
+                    try:
+                        self._split_stats["blocked_corr"] += 1
+                        self.logger.debug(f"Gate blocked (corr): {symbol}")
+                    except Exception:
+                        pass
+                    return
                 order_id = det.execute_signal(sig)
                 if order_id:
                     self.db.insert_sp_order(signal_id, order_id, symbol, "Buy", (self.config.trade_notional_usdt or 0.0) / max(price, 1e-9), price * (1.0 - float(self.config.limit_order_offset)), status="placed")
+                    try:
+                        if self._metrics is not None:
+                            self._metrics.on_place()
+                    except Exception:
+                        pass
+                    try:
+                        self._split_stats["orders"] += 1
+                    except Exception:
+                        pass
+                    try:
+                        self._corr_guard.register_long(symbol, _time.time())
+                    except Exception:
+                        pass
                     self.notifier.send_telegram(f"SPLIT ORDER: {symbol} placed limit with TP {self.config.target_profit_pct*100:.2f}%")
         except Exception as e:
             self.logger.error(f"Split ticker handler error for {symbol}: {e}")
@@ -511,7 +650,7 @@ class MarketMonitor:
         try:
             det = self._split_detectors.get(symbol)
             if det is None:
-                det = SpikeDetector(self.config, order_manager=self.order_manager)
+                det = SpikeDetector(self.config, order_manager=self.order_manager, db=self.db)
                 self._split_detectors[symbol] = det
             det.update_orderbook(best_bid, best_ask, bids=bids, asks=asks, levels=5)
         except Exception as e:
@@ -522,7 +661,7 @@ class MarketMonitor:
             # Use trade volumes to enrich volume buffer
             det = self._split_detectors.get(symbol)
             if det is None:
-                det = SpikeDetector(self.config, order_manager=self.order_manager)
+                det = SpikeDetector(self.config, order_manager=self.order_manager, db=self.db)
                 self._split_detectors[symbol] = det
             # approximate: push price and qty as volume increment
             det.update_market_data(price, max(qty, 0.0), datetime.utcnow())
@@ -880,6 +1019,10 @@ class MarketMonitor:
                     with self._signals_lock:
                         self._pending_signals.clear()
                     self._monitor_take_profit_once()
+                    try:
+                        self.position_manager.monitor_once()
+                    except Exception:
+                        pass
                     now = time.time()
                     if now - self._last_sync_time >= 20.0:
                         self.order_manager.sync_cancellations()
@@ -902,6 +1045,14 @@ class MarketMonitor:
                         oi_change=signal_obj.oi_change_percent,
                     )
                 self._monitor_take_profit_once()
+                try:
+                    self.position_manager.monitor_once()
+                except Exception:
+                    pass
+                try:
+                    self.position_manager.monitor_once()
+                except Exception:
+                    pass
                 now = time.time()
                 if now - self._last_sync_time >= 20.0:
                     self.order_manager.sync_cancellations()

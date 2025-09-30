@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable, List, Optional
+import os
 
 from bybit_trading_bot.utils.logger import get_logger
 
@@ -91,11 +92,12 @@ class WebSocketHandler:
                         self._ws.orderbook_50_stream(callback=(lambda msg, s=sym: self._on_raw_orderbook(msg, s, on_orderbook)), symbol=sym)  # type: ignore[attr-defined]
                     except Exception as e:
                         self.logger.debug(f"Orderbook subscribe not available for {sym}: {e}")
-                # Public trades
+                # Public trades (optional noisy): enable with WS_TRADE_DEBUG=true
                 try:
                     self._ws.public_trade_stream(callback=(lambda msg, s=sym: self._on_raw_trade(msg, s, on_trade)), symbol=sym)  # type: ignore[attr-defined]
                 except Exception as e:
-                    self.logger.debug(f"Trade subscribe not available for {sym}: {e}")
+                    if (os.getenv("WS_TRADE_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y"}:
+                        self.logger.debug(f"Trade subscribe not available for {sym}: {e}")
                 time.sleep(0.03)  # pacing
             self._last_tick_time = time.time()
             self.logger.info(f"Subscribed orderbook/trades for {len(symbols)} symbols")
@@ -171,8 +173,9 @@ class WebSocketHandler:
                     pass
             try:
                 self._ws.public_trade_stream(callback=(lambda msg, s=sym: self._on_raw_trade(msg, s, on_trade)), symbol=sym)  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            except Exception as e:
+                if (os.getenv("WS_TRADE_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y"}:
+                    self.logger.debug(f"Trade subscribe not available for {sym}: {e}")
             time.sleep(0.03)
         self._last_tick_time = time.time()
         self.logger.info(f"Resubscribed to {len(symbols)} spot tickers")

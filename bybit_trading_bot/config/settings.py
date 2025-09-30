@@ -67,14 +67,40 @@ class Config:
     split_trading_pairs: Optional[str]
     # Fees
     fee_rate: float
+    # OBV/Volume confirmations
+    obv_enabled: bool
+    obv_trend_periods: int
+    volume_quality_check: bool
+    require_obv_confirmation: bool
+    # MTF filter
+    mtf_enabled: bool
+    mtf_require_confirmation: bool
     # TP forecast gating
     tp_forecast_enabled: bool
     tp_forecast_horizon_minutes: int
     tp_forecast_min_score: float
     tp_forecast_use_orderbook: bool
+    # Probability gate (split)
+    tp_prob_threshold: float
+    tp_prob_min_delta: float
     # Time-stop exit
     time_stop_enabled: bool
     time_stop_minutes: int
+    # Dynamic limit offset for split mode
+    dynamic_offset_enabled: bool
+    offset_vol_k: float
+    offset_spread_k: float
+    max_adverse_move_bp: int
+    # ATR Risk Management
+    atr_enabled: bool
+    atr_period: int
+    atr_sl_multiplier: float
+    atr_trail_multiplier: float
+    dynamic_sl_enabled: bool
+    # Adaptive TP overlays (partial support)
+    tp1_atr_multiplier: float
+    tp1_percent: float
+    break_even_enabled: bool
 
 
 def _get_bool(value: str | None, default: bool) -> bool:
@@ -144,14 +170,40 @@ def load_settings() -> Config:
     split_max_open_orders = int(os.getenv("SPLIT_MAX_OPEN_ORDERS", "3"))
     split_trading_pairs = os.getenv("SPLIT_TRADING_PAIRS")
     fee_rate = float(os.getenv("FEE_RATE", "0.001"))
+    # OBV/Volume confirmations
+    obv_enabled = _get_bool(os.getenv("OBV_ENABLED"), True)
+    obv_trend_periods = int(os.getenv("OBV_TREND_PERIODS", "10"))
+    volume_quality_check = _get_bool(os.getenv("VOLUME_QUALITY_CHECK"), True)
+    require_obv_confirmation = _get_bool(os.getenv("REQUIRE_OBV_CONFIRMATION"), False)
+    # MTF filter
+    mtf_enabled = _get_bool(os.getenv("MTF_ENABLED"), True)
+    mtf_require_confirmation = _get_bool(os.getenv("MTF_REQUIRE_CONFIRMATION"), True)
     # TP forecast gating
     tp_forecast_enabled = _get_bool(os.getenv("TP_FORECAST_ENABLED"), True)
     tp_forecast_horizon_minutes = int(os.getenv("TP_FORECAST_HORIZON_MINUTES", "15"))
     tp_forecast_min_score = float(os.getenv("TP_FORECAST_MIN_SCORE", "0.65"))
     tp_forecast_use_orderbook = _get_bool(os.getenv("TP_FORECAST_USE_ORDERBOOK"), True)
+    # Probability gate (split)
+    tp_prob_threshold = float(os.getenv("TP_PROB_THRESHOLD", "0.72"))
+    tp_prob_min_delta = float(os.getenv("TP_PROB_MIN_DELTA", "0.05"))
     # Time-stop exit
     time_stop_enabled = _get_bool(os.getenv("TIME_STOP_ENABLED"), True)
     time_stop_minutes = int(os.getenv("TIME_STOP_MINUTES", "30"))
+    # Dynamic limit offset for split mode
+    dynamic_offset_enabled = _get_bool(os.getenv("DYNAMIC_OFFSET_ENABLED"), True)
+    offset_vol_k = float(os.getenv("OFFSET_VOL_K", "0.6"))
+    offset_spread_k = float(os.getenv("OFFSET_SPREAD_K", "0.5"))
+    max_adverse_move_bp = int(os.getenv("MAX_ADVERSE_MOVE_BP", "35"))
+    # ATR Risk Management
+    atr_enabled = _get_bool(os.getenv("ATR_ENABLED"), True)
+    atr_period = int(os.getenv("ATR_PERIOD", "14"))
+    atr_sl_multiplier = float(os.getenv("ATR_SL_MULTIPLIER", "2.0"))
+    atr_trail_multiplier = float(os.getenv("ATR_TRAIL_MULTIPLIER", "2.5"))
+    dynamic_sl_enabled = _get_bool(os.getenv("DYNAMIC_SL_ENABLED"), True)
+    # Adaptive TP overlays (partial support)
+    tp1_atr_multiplier = float(os.getenv("TP1_ATR_MULTIPLIER", "1.5"))
+    tp1_percent = float(os.getenv("TP1_PERCENT", "0.012"))
+    break_even_enabled = _get_bool(os.getenv("BREAK_EVEN_ENABLED"), True)
 
     return Config(
         bybit_api_key=bybit_api_key,
@@ -203,10 +255,30 @@ def load_settings() -> Config:
         split_max_open_orders=split_max_open_orders,
         split_trading_pairs=split_trading_pairs,
         fee_rate=fee_rate,
+        obv_enabled=obv_enabled,
+        obv_trend_periods=obv_trend_periods,
+        volume_quality_check=volume_quality_check,
+        require_obv_confirmation=require_obv_confirmation,
+        mtf_enabled=mtf_enabled,
+        mtf_require_confirmation=mtf_require_confirmation,
         tp_forecast_enabled=tp_forecast_enabled,
         tp_forecast_horizon_minutes=tp_forecast_horizon_minutes,
         tp_forecast_min_score=tp_forecast_min_score,
         tp_forecast_use_orderbook=tp_forecast_use_orderbook,
+        tp_prob_threshold=tp_prob_threshold,
+        tp_prob_min_delta=tp_prob_min_delta,
         time_stop_enabled=time_stop_enabled,
         time_stop_minutes=time_stop_minutes,
+        dynamic_offset_enabled=dynamic_offset_enabled,
+        offset_vol_k=offset_vol_k,
+        offset_spread_k=offset_spread_k,
+        max_adverse_move_bp=max_adverse_move_bp,
+        atr_enabled=atr_enabled,
+        atr_period=atr_period,
+        atr_sl_multiplier=atr_sl_multiplier,
+        atr_trail_multiplier=atr_trail_multiplier,
+        dynamic_sl_enabled=dynamic_sl_enabled,
+        tp1_atr_multiplier=tp1_atr_multiplier,
+        tp1_percent=tp1_percent,
+        break_even_enabled=break_even_enabled,
     ) 
